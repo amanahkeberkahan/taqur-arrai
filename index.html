@@ -1,0 +1,1845 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
+<meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
+<meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
+<meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
+<meta name="twitter:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Amanah, Sehat, Berkualitas.">
+<link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&family=Cinzel:wght@700;900&family=Cinzel+Decorative:wght@700&family=Tajawal:wght@300;400;500;700&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+  🔥 LANGKAH 1: PASTE FIREBASE CONFIG ANDA DI BAWAH INI
+  Cara dapat config:
+  1. Buka console.firebase.google.com
+  2. Pilih project Anda → klik ⚙️ Project Settings
+  3. Scroll ke "Your apps" → klik icon </> (Web)
+  4. Register app → copy bagian firebaseConfig
+  5. Paste di bawah ini (ganti semua nilai "GANTI_...")
+============================================================ -->
+<script type="module">
+import { initializeApp }    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, addDoc, getDocs, doc,
+         updateDoc, query, where, orderBy, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ▼▼▼ PASTE CONFIG DI SINI ▼▼▼
+const firebaseConfig = {
+  apiKey:            "AIzaSyBXJmAouGMVXnYd6DYhFKYnvqESMvVKTaA",
+  authDomain:        "taqur-bmk.firebaseapp.com",
+  projectId:         "taqur-bmk",
+  storageBucket:     "taqur-bmk.firebasestorage.app",
+  messagingSenderId: "544423225670",
+  appId:             "1:544423225670:web:3a503ed9174d4863d95d47",
+  measurementId:     "G-V4YHVQ5K3F"
+};
+// ▲▲▲ SAMPAI SINI ▲▲▲
+
+// ============================================================
+// ⚙️ LANGKAH 2: SESUAIKAN KONFIGURASI PROGRAM
+// ============================================================
+
+// Password login admin (username : password)
+const ADMIN_USERS = {
+  "admin":    { nama: "Admin Utama", pass: "bmk2024",  role: "superadmin" },
+  "petugas1": { nama: "Petugas 1",  pass: "ptgs1",     role: "admin" },
+  "petugas2": { nama: "Petugas 2",  pass: "ptgs2",     role: "admin" },
+};
+
+// Teks estimasi harga default (bisa diubah dari Admin → Setting)
+const DEFAULT_ESTIMASI =
+  "🐑 Kambing / Domba mulai Rp 3.500.000 / ekor\n" +
+  "📌 Info harga resmi akan diumumkan menjelang Dzulqaidah\n" +
+  "💡 Nominal tabungan bisa di-upgrade kapan saja";
+
+// ============================================================
+// INISIALISASI FIREBASE
+// ============================================================
+const fbApp  = initializeApp(firebaseConfig);
+const db     = getFirestore(fbApp);
+
+// ============================================================
+// UTILS
+// ============================================================
+const rp   = n => 'Rp ' + Number(n||0).toLocaleString('id-ID');
+const pct  = (v,t) => t ? Math.min(100, Math.round(v/t*100)) : 0;
+const normHP = hp => hp.replace(/\D/g,'').replace(/^0/,'62');
+const tglFmt = ts => {
+  if (!ts) return '-';
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  return d.toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'});
+};
+const tglFull = ts => {
+  if (!ts) return '-';
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  return d.toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'});
+};
+
+function showAlert(id, type, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'alert ' + type + ' show';
+  el.textContent = msg;
+  setTimeout(() => el.classList.remove('show'), 5000);
+}
+function setLoading(id, on) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.disabled = on;
+  el.style.opacity = on ? '.6' : '1';
+}
+function copyText(text, btnId) {
+  const b = document.getElementById(btnId);
+  const o = b ? b.textContent : '';
+  const succeed = () => {
+    if (!b) return;
+    b.textContent = '✅ Tersalin!';
+    setTimeout(() => b.textContent = o, 2000);
+  };
+  // Modern clipboard API
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(succeed).catch(() => fallbackCopy(text, succeed));
+  } else {
+    fallbackCopy(text, succeed);
+  }
+}
+function fallbackCopy(text, cb) {
+  const el = document.createElement('textarea');
+  el.value = text;
+  el.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+  document.body.appendChild(el);
+  el.focus();
+  el.select();
+  try { document.execCommand('copy'); cb(); } catch(e) {}
+  document.body.removeChild(el);
+}
+
+// ============================================================
+// SETTINGS (tersimpan di Firestore collection "settings")
+// ============================================================
+async function getSetting(key, def) {
+  try {
+    const snap = await getDocs(query(collection(db,'settings'), where('key','==',key)));
+    if (!snap.empty) return snap.docs[0].data().value;
+    return def;
+  } catch { return def; }
+}
+async function setSetting(key, value) {
+  const snap = await getDocs(query(collection(db,'settings'), where('key','==',key)));
+  if (snap.empty) {
+    await addDoc(collection(db,'settings'), { key, value });
+  } else {
+    await updateDoc(doc(db,'settings',snap.docs[0].id), { value });
+  }
+}
+
+// ============================================================
+// NAV
+// ============================================================
+let currentAdmin = null;
+window.showPage = function(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.querySelector(`.nav-tab[data-page="${id}"]`).classList.add('active');
+  if (id==='dashboard') loadDashboard();
+  if (id==='admin' && currentAdmin) renderAdminPanel();
+  if (id==='daftar') { loadEstimasiDisplay(); renderPaketDaftar(); }
+  if (id==='setor') document.getElementById('setor-tgl').value = new Date().toISOString().split('T')[0];
+};
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+async function loadDashboard() {
+  try {
+    const [pSnap, sSnap] = await Promise.all([
+      getDocs(collection(db,'peserta')),
+      getDocs(query(collection(db,'setoran'), where('status','==','confirmed')))
+    ]);
+    const peserta   = pSnap.docs.map(d => ({id:d.id,...d.data()})).filter(p => !p.deleted);
+    const confirmed = sSnap.docs.map(d => d.data());
+    const totalDana   = confirmed.reduce((a,s) => a+s.nominal, 0);
+    const totalTarget = peserta.reduce((a,p) => a+(p.targetNominal||0), 0);
+    const pc = pct(totalDana, totalTarget);
+
+    document.getElementById('dash-peserta').textContent  = peserta.length;
+    document.getElementById('dash-total').textContent    = rp(totalDana);
+    document.getElementById('dash-pct').textContent      = pc+'%';
+    document.getElementById('dash-collected').textContent= 'Terkumpul: '+rp(totalDana);
+    document.getElementById('dash-pct2').textContent     = pc+'%';
+    document.getElementById('dash-bar').style.width      = pc+'%';
+    document.getElementById('dash-target-label').textContent = 'Target kolektif: '+rp(totalTarget);
+    document.getElementById('dash-target-sub').textContent   =
+      `${peserta.length} peserta · rata-rata ${peserta.length ? rp(Math.round(totalTarget/peserta.length)) : rp(0)} / orang`;
+
+    // TOP 5
+    const top5El  = document.getElementById('dash-top5');
+    const seeBtn  = document.getElementById('see-all-btn');
+    if (!peserta.length) {
+      top5El.innerHTML = '<div class="empty-state"><div class="ei">🐑</div><p>Belum ada peserta.<br>Jadilah yang pertama!</p></div>';
+      seeBtn.style.display = 'none';
+      return;
+    }
+    const sorted = peserta.map(p => ({
+      ...p,
+      saldo: confirmed.filter(s=>s.pesertaId===p.id).reduce((a,s)=>a+s.nominal,0)
+    })).sort((a,b) => b.saldo - a.saldo);
+
+    const rankClass = ['rank-1','rank-2','rank-3','rank-n','rank-n'];
+    const rankLabel = ['🥇','🥈','🥉','4','5'];
+    top5El.innerHTML = sorted.slice(0,5).map((p,i) => {
+      const pc2 = pct(p.saldo, p.targetNominal||3500000);
+      return `<div class="top-item">
+        <div class="top-rank ${rankClass[i]}">${rankLabel[i]}</div>
+        <div class="top-info">
+          <div class="top-nama">${p.nama}</div>
+          <div class="top-jenis">${p.jenis}</div>
+          <div class="mini-bar" style="margin-top:3px"><div class="mini-fill" style="width:${pc2}%"></div></div>
+        </div>
+        <div class="top-saldo">
+          <div class="top-nom">${rp(p.saldo)}</div>
+          <div class="top-pct">${pc2}% target</div>
+        </div>
+      </div>`;
+    }).join('');
+    seeBtn.style.display = peserta.length > 5 ? 'block' : 'none';
+  } catch(e) {
+    document.getElementById('dash-top5').innerHTML =
+      `<div class="empty-state"><p>⚠️ Koneksi Firebase gagal.<br><small>${e.message}</small></p></div>`;
+  }
+}
+
+// ============================================================
+// ESTIMASI HARGA
+// ============================================================
+async function loadEstimasiDisplay() {
+  const est = await getSetting('estimasi', DEFAULT_ESTIMASI);
+  document.getElementById('estimasi-text').innerHTML = est.replace(/\n/g,'<br>');
+}
+
+window.updateEstimasi = function() {
+  const val = parseInt(document.getElementById('daftar-target').value);
+  const el  = document.getElementById('target-hint');
+  if (val >= 100000) {
+    const ekor = Math.floor(val / 3500000);
+    const sisa = val % 3500000;
+    let hint = ekor > 0
+      ? `🐑 Sekitar <strong>${ekor} ekor</strong> kambing/domba`
+      : `📌 Belum mencapai 1 ekor (estimasi mulai Rp 3.500.000)`;
+    if (sisa > 0 && ekor > 0) hint += ` + sisa ${rp(sisa)}`;
+    el.innerHTML = hint;
+    el.style.display = 'block';
+  } else { el.style.display='none'; }
+};
+
+// ============================================================
+// PAKET SELECT
+// ============================================================
+window.pilihPaketBaru = function(el, label, nominal) {
+  document.querySelectorAll('.paket-list-item').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  document.getElementById('daftar-jenis').value  = label;
+  document.getElementById('daftar-target').value = nominal;
+  document.getElementById('custom-target-input').value = '';
+  document.getElementById('custom-hint').style.display = 'none';
+  const info = document.getElementById('paket-selected-info');
+  document.getElementById('paket-selected-label').textContent = label + ' (Target: Rp ' + Number(nominal).toLocaleString('id-ID') + ')';
+  info.style.display = 'block';
+};
+
+window.inputNominalCustom = function() {
+  const val = parseInt(document.getElementById('custom-target-input').value);
+  const hint = document.getElementById('custom-hint');
+  if (val >= 100000) {
+    hint.style.display = 'block';
+    hint.textContent = '💡 Target: Rp ' + Number(val).toLocaleString('id-ID');
+  } else {
+    hint.style.display = 'none';
+  }
+};
+
+window.terapkanNominalCustom = function() {
+  const val = parseInt(document.getElementById('custom-target-input').value);
+  if (!val || val < 1) {
+    showAlert('alert-daftar','error','Masukkan nominal yang valid.');
+    return;
+  }
+  document.querySelectorAll('.paket-list-item').forEach(c => c.classList.remove('selected'));
+  document.getElementById('daftar-jenis').value  = 'Custom · Rp ' + Number(val).toLocaleString('id-ID');
+  document.getElementById('daftar-target').value = val;
+  const info = document.getElementById('paket-selected-info');
+  document.getElementById('paket-selected-label').textContent = 'Custom · Target Rp ' + Number(val).toLocaleString('id-ID');
+  info.style.display = 'block';
+  document.getElementById('custom-hint').style.display = 'none';
+};
+
+window.formatNominalSetor = function(el) {
+  const raw = el.value.replace(/\D/g,'');
+  const num = parseInt(raw) || 0;
+  el.value = num ? num.toLocaleString('id-ID') : '';
+  const hint = document.getElementById('setor-nominal-hint');
+  if (num >= 1000) {
+    hint.style.display = 'block';
+    hint.textContent = '💰 ' + num.toLocaleString('id-ID') + ' rupiah';
+  } else {
+    hint.style.display = 'none';
+  }
+};
+// ============================================================
+window.bukaModalSK = function() {
+  document.getElementById('modal-sk').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  renderSKModal();
+  // Aktifkan checkbox setelah user membuka S&K
+  document.getElementById('setuju-sk').disabled = false;
+  document.getElementById('sk-hint').style.display = 'none';
+};
+window.tutupModalSK = function(e) {
+  if (e && e.target !== document.getElementById('modal-sk')) return;
+  document.getElementById('modal-sk').classList.remove('open');
+  document.body.style.overflow = '';
+};
+window.setujuSK = function() {
+  document.getElementById('setuju-sk').checked = true;
+  toggleBtnDaftar();
+  document.getElementById('modal-sk').classList.remove('open');
+  document.body.style.overflow = '';
+};
+window.toggleBtnDaftar = function() {
+  const checked = document.getElementById('setuju-sk').checked;
+  const btn = document.getElementById('btn-daftar');
+  btn.disabled = !checked;
+  btn.style.opacity = checked ? '1' : '.5';
+  btn.style.cursor  = checked ? 'pointer' : 'not-allowed';
+};
+
+// Tampilkan hint jika user klik checkbox sebelum baca S&K
+document.addEventListener('DOMContentLoaded', () => {
+  const cb = document.getElementById('setuju-sk');
+  if (cb) {
+    cb.addEventListener('click', function(e) {
+      if (this.disabled) {
+        e.preventDefault();
+        document.getElementById('sk-hint').style.display = 'block';
+      }
+    });
+  }
+});
+
+// ============================================================
+// DAFTAR PESERTA
+// ============================================================
+window.daftarPeserta = async function() {
+  const nama   = document.getElementById('daftar-nama').value.trim();
+  const hp     = normHP(document.getElementById('daftar-hp').value.trim());
+  const alamat = document.getElementById('daftar-alamat').value.trim();
+  const jenis  = document.getElementById('daftar-jenis').value;
+  const target = parseInt(document.getElementById('daftar-target').value);
+
+  if (!nama)              return showAlert('alert-daftar','error','Nama tidak boleh kosong.');
+  if (!hp||hp.length<10)  return showAlert('alert-daftar','error','No. HP tidak valid.');
+  if (!alamat||alamat.length<10) return showAlert('alert-daftar','error','Mohon isi alamat lengkap (jalan, kelurahan, kecamatan).');
+  if (!jenis)             return showAlert('alert-daftar','error','Pilih paket tabungan terlebih dahulu.');
+  if (!target||target<1) return showAlert('alert-daftar','error','Target nominal wajib diisi.');
+
+  setLoading('btn-daftar', true);
+  try {
+    const cek = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
+    const aktif = cek.docs.filter(d => !d.data().deleted);
+    if (aktif.length > 0) {
+      showAlert('alert-daftar','error','No. HP sudah terdaftar.');
+      setLoading('btn-daftar', false);
+      return;
+    }
+    await addDoc(collection(db,'peserta'), {
+      nama, hp, alamat, jenis, targetNominal: target,
+      nomorVA: '', tglDaftar: serverTimestamp()
+    });
+    ['daftar-nama','daftar-hp','daftar-alamat'].forEach(id => document.getElementById(id).value='');
+    document.getElementById('daftar-jenis').value='';
+    document.getElementById('daftar-target').value='';
+    document.getElementById('custom-target-input').value='';
+    document.getElementById('custom-hint').style.display='none';
+    document.getElementById('paket-selected-info').style.display='none';
+    document.querySelectorAll('.paket-list-item').forEach(c => c.classList.remove('selected'));
+    const cb = document.getElementById('setuju-sk');
+    cb.checked = false; cb.disabled = true;
+    toggleBtnDaftar();
+    document.getElementById('sk-hint').style.display='none';
+    const sukses = document.getElementById('daftar-sukses');
+    sukses.style.display = 'block';
+    sukses.scrollIntoView({behavior:'smooth'});
+    await loadPesertaCache();
+  } catch(e) { showAlert('alert-daftar','error','Gagal mendaftar: '+e.message); }
+  setLoading('btn-daftar', false);
+};
+
+// ============================================================
+// PESERTA CACHE (untuk autocomplete setor)
+// ============================================================
+let pesertaCache = [];
+async function loadPesertaCache() {
+  const snap = await getDocs(collection(db,'peserta'));
+  pesertaCache = snap.docs.map(d => ({id:d.id,...d.data()})).filter(p => !p.deleted);
+}
+loadPesertaCache();
+
+// ============================================================
+// CEK VA
+// ============================================================
+window.cekVA = async function() {
+  const hp    = normHP(document.getElementById('va-hp').value.trim());
+  const resEl = document.getElementById('va-result');
+  if (!hp||hp.length<10) { showAlert('alert-va','error','Masukkan No. HP yang valid.'); return; }
+  showAlert('alert-va','info','⏳ Mencari data...');
+  try {
+    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
+    const aktivDocs = snap.docs.filter(d => !d.data().deleted);
+    if (!aktivDocs.length) { showAlert('alert-va','error','No. HP tidak ditemukan. Pastikan sudah mendaftar.'); resEl.innerHTML=''; return; }
+    document.getElementById('alert-va').classList.remove('show');
+    const p = {id:aktivDocs[0].id,...aktivDocs[0].data()};
+    if (!p.nomorVA) {
+      resEl.innerHTML = `<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center">
+        <div style="font-size:36px;margin-bottom:8px">⏳</div>
+        <div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Belum Tersedia</div>
+        <div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6;margin-bottom:14px">Halo <strong>${p.nama}</strong>, No. VA BSI Anda sedang disiapkan admin.</div>
+        <div style="background:rgba(201,168,76,.15);border-radius:10px;padding:12px;border:1px solid rgba(201,168,76,.3);font-size:12px;color:rgba(255,255,255,.8)">
+          <div style="color:var(--emas);font-weight:700;margin-bottom:4px">📞 Hubungi Admin TaQur Ar-Ra'i</div>
+          <div id="kontak-setor-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:var(--emas-light);text-decoration:none">📱 Aynur: +62 821-3969-1445</a><br><a href="https://wa.me/6285733844255" target="_blank" style="color:var(--emas-light);text-decoration:none">📱 Chandra: +62 857-3384-4255</a></div>
+        </div>
+      </div>`;
+    } else {
+      resEl.innerHTML = `
+        <div class="va-card">
+          <div class="va-bank">🏦 Bank Syariah Indonesia</div>
+          <div class="va-label">Virtual Account BSI</div>
+          <div class="va-number">${p.nomorVA}</div>
+          <div class="va-owner">
+            <div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div>
+            <div style="font-size:15px;font-weight:700;color:var(--emas-light)">${p.nama}</div>
+            <div style="font-size:11px;color:rgba(255,255,255,.5)">${p.jenis}</div>
+            <div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div>
+          </div>
+        </div>
+        <div class="va-steps">
+          <div class="va-step"><span class="vs-num">1</span><span>Buka aplikasi BSI Mobile / m-Banking manapun</span></div>
+          <div class="va-step"><span class="vs-num">2</span><span>Pilih menu <strong>Transfer → Virtual Account</strong></span></div>
+          <div class="va-step"><span class="vs-num">3</span><span>Masukkan nomor VA di atas</span></div>
+          <div class="va-step"><span class="vs-num">4</span><span>Masukkan nominal sesuai pilihan nabung Anda</span></div>
+          <div class="va-step"><span class="vs-num">5</span><span>Buka menu <strong>Setor</strong> untuk konfirmasi pembayaran ke admin</span></div>
+        </div>
+        <div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div>`;
+    }
+    resEl.style.display = 'block';
+  } catch(e) { showAlert('alert-va','error','Gagal: '+e.message); }
+};
+
+// ============================================================
+// SETOR
+// ============================================================
+let selPeserta = null;
+
+window.cariPesertaSetor = async function() {
+  const hp = normHP(document.getElementById('setor-hp').value.trim());
+  const el = document.getElementById('setor-info');
+  if (!hp||hp.length<10) { el.innerHTML=''; el.style.display='none'; selPeserta=null; return; }
+  let p = pesertaCache.find(x => x.hp===hp);
+  if (!p) {
+    // fallback: query firestore
+    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
+    const aktif = snap.docs.filter(d => !d.data().deleted);
+    if (aktif.length) p = {id:aktif[0].id,...aktif[0].data()};
+  }
+  if (p) {
+    selPeserta = p;
+    const vaInfo = p.nomorVA
+      ? `<div style="font-size:11px;color:var(--hijau-mid)">🏦 VA BSI: <strong>${p.nomorVA}</strong></div>`
+      : `<div style="font-size:11px;color:#e65100">⚠️ No. VA belum diassign — hubungi admin</div>`;
+    el.innerHTML = `<div class="peserta-found">
+      <div class="avatar" style="width:32px;height:32px;font-size:14px">${p.nama.charAt(0).toUpperCase()}</div>
+      <div style="flex:1">
+        <div style="font-weight:700;font-size:13px;color:var(--hijau)">✅ ${p.nama}</div>
+        <div style="font-size:11px;color:#888">${p.jenis}</div>
+        <div style="font-size:11px;color:var(--hijau-mid)">🎯 Target: ${rp(p.targetNominal||0)}</div>
+        ${vaInfo}
+      </div>
+    </div>`;
+  } else {
+    selPeserta = null;
+    el.innerHTML = `<div style="padding:8px 12px;background:#fde8e8;border-radius:8px;font-size:12px;color:#c62828">❌ No. HP tidak ditemukan. Pastikan sudah mendaftar.</div>`;
+  }
+  el.style.display = 'block';
+};
+
+window.inputSetoran = async function() {
+  const nominal = parseInt(document.getElementById('setor-nominal').value.replace(/\D/g,''));
+  const tgl     = document.getElementById('setor-tgl').value;
+  const catatan = document.getElementById('setor-catatan').value.trim();
+  if (!selPeserta)            return showAlert('alert-setor','error','Masukkan No. HP dan pastikan peserta ditemukan.');
+  if (!nominal||nominal<1000) return showAlert('alert-setor','error','Nominal minimal Rp 1.000.');
+  if (!tgl)                   return showAlert('alert-setor','error','Tanggal wajib diisi.');
+
+  setLoading('btn-setor', true);
+  try {
+    await addDoc(collection(db,'setoran'), {
+      pesertaId: selPeserta.id, nama: selPeserta.nama, hp: selPeserta.hp,
+      nomorVA: selPeserta.nomorVA||'', nominal, tgl, catatan,
+      cara: 'Transfer VA BSI', status: 'pending', tglInput: serverTimestamp()
+    });
+    document.getElementById('setor-hp').value='';
+    document.getElementById('setor-nominal').value='';
+    document.getElementById('setor-catatan').value='';
+    document.getElementById('setor-info').style.display='none';
+    selPeserta = null;
+    await updateBadge();
+    showAlert('alert-setor','success','✅ Setoran dikirim! Menunggu konfirmasi admin. Saldo terupdate setelah disetujui.');
+  } catch(e) { showAlert('alert-setor','error','Gagal: '+e.message); }
+  setLoading('btn-setor', false);
+};
+
+// ============================================================
+// CEK SALDO
+// ============================================================
+window.cekSaldo = async function() {
+  const hp    = normHP(document.getElementById('cek-hp').value.trim());
+  const resEl = document.getElementById('saldo-result');
+  if (!hp||hp.length<10) { showAlert('alert-cek','error','Masukkan No. HP yang valid.'); resEl.style.display='none'; return; }
+  showAlert('alert-cek','info','⏳ Mencari data...');
+  try {
+    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
+    const aktivDocs = snap.docs.filter(d => !d.data().deleted);
+    if (!aktivDocs.length) { showAlert('alert-cek','error','No. HP tidak ditemukan.'); resEl.style.display='none'; return; }
+    document.getElementById('alert-cek').classList.remove('show');
+    const p = {id:aktivDocs[0].id,...aktivDocs[0].data()};
+    const sSnap = await getDocs(query(collection(db,'setoran'), where('pesertaId','==',p.id), orderBy('tglInput','desc')));
+    const all       = sSnap.docs.map(d=>({id:d.id,...d.data()}));
+    const confirmed = all.filter(s=>s.status==='confirmed');
+    const pending   = all.filter(s=>s.status==='pending');
+    const saldo   = confirmed.reduce((a,s)=>a+s.nominal,0);
+    const targetP = p.targetNominal||3500000;
+    const pc      = pct(saldo, targetP);
+
+    document.getElementById('res-nama').textContent   = p.nama;
+    document.getElementById('res-hp').textContent     = '📞 '+p.hp;
+    document.getElementById('res-jenis').textContent  = p.jenis+(p.nomorVA?' · VA: '+p.nomorVA:'');
+    document.getElementById('res-saldo').textContent  = rp(saldo);
+    document.getElementById('res-pct').textContent    = pc+'%';
+    document.getElementById('res-target').textContent = 'dari target pribadi '+rp(targetP);
+    setTimeout(() => document.getElementById('res-bar').style.width=pc+'%', 100);
+
+    const pEl = document.getElementById('res-pending');
+    if (pending.length) {
+      pEl.textContent = `⏳ ${pending.length} setoran menunggu konfirmasi (${rp(pending.reduce((a,s)=>a+s.nominal,0))})`;
+      pEl.style.display = 'block';
+    } else pEl.style.display='none';
+
+    document.getElementById('res-history').innerHTML = !all.length
+      ? '<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'
+      : all.map(s => {
+          const badge = s.status==='confirmed' ? '<span class="badge badge-green">✅ Dikonfirmasi</span>'
+            : s.status==='rejected' ? '<span class="badge badge-red">❌ Ditolak</span>'
+            : '<span class="badge badge-yellow">⏳ Menunggu</span>';
+          return `<div class="history-item">
+            <div>
+              <div style="font-weight:600;font-size:13px">Transfer VA BSI ${badge}</div>
+              <div class="h-tgl">${tglFull(s.tglInput)}</div>
+              ${s.catatan?`<div class="h-tgl">📝 ${s.catatan}</div>`:''}
+              ${s.alasanTolak?`<div class="h-tgl" style="color:#c62828">❌ ${s.alasanTolak}</div>`:''}
+            </div>
+            <div class="h-nom">+${rp(s.nominal)}</div>
+          </div>`;
+        }).join('');
+    resEl.style.display = 'block';
+  } catch(e) { showAlert('alert-cek','error','Gagal: '+e.message); }
+};
+
+// ============================================================
+// ADMIN
+// ============================================================
+window.adminLogin = function() {
+  const user = document.getElementById('admin-user').value.trim();
+  const pass = document.getElementById('admin-pass').value;
+  const adm  = ADMIN_USERS[user];
+  if (adm && adm.pass===pass) {
+    currentAdmin = {user, nama:adm.nama, role:adm.role};
+    document.getElementById('admin-login-wrap').style.display='none';
+    document.getElementById('admin-panel').style.display='block';
+    document.getElementById('adm-welcome').textContent = adm.nama+' · '+(adm.role==='superadmin'?'Super Admin':'Petugas');
+    renderAdminPanel();
+  } else showAlert('alert-admin','error','Username atau password salah.');
+};
+window.adminLogout = function() {
+  currentAdmin = null;
+  document.getElementById('admin-login-wrap').style.display='block';
+  document.getElementById('admin-panel').style.display='none';
+  document.getElementById('admin-pass').value='';
+  document.getElementById('nav-admin-btn').style.display='none';
+  showPage('dashboard');
+};
+
+let allPeserta=[], allSetoran=[];
+let adminFilter='all', adminSort='nama', adminView='list', detailId=null;
+
+async function renderAdminPanel() {
+  try {
+    const [pSnap, sSnap] = await Promise.all([
+      getDocs(collection(db,'peserta')),
+      getDocs(collection(db,'setoran'))
+    ]);
+    allPeserta = pSnap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);
+    allSetoran = sSnap.docs.map(d=>({id:d.id,...d.data()}));
+    const pending   = allSetoran.filter(s=>s.status==='pending');
+    const confirmed = allSetoran.filter(s=>s.status==='confirmed');
+    const belumVA   = allPeserta.filter(p=>!p.nomorVA);
+
+    document.getElementById('adm-peserta').textContent      = allPeserta.length;
+    document.getElementById('adm-total').textContent        = rp(confirmed.reduce((a,s)=>a+s.nominal,0));
+    document.getElementById('adm-pending-stat').textContent = pending.length;
+    await updateBadge();
+
+    const warn = document.getElementById('adm-va-warn');
+    if (belumVA.length) { warn.textContent=`⚠️ ${belumVA.length} peserta belum punya No. VA`; warn.style.display='block'; }
+    else warn.style.display='none';
+
+    // load estimasi ke textarea
+    const est = await getSetting('estimasi', DEFAULT_ESTIMASI);
+    document.getElementById('adm-estimasi').value = est;
+
+    renderPendingList(pending);
+    if (adminView==='list') renderPesertaList();
+  } catch(e) { console.error(e); }
+}
+window.renderAdminPanel = renderAdminPanel;
+
+async function updateBadge() {
+  try {
+    const snap = await getDocs(query(collection(db,'setoran'), where('status','==','pending')));
+    const n = snap.size;
+    const b = document.getElementById('badge-pending');
+    b.textContent = n; b.style.display = n?'inline-block':'none';
+  } catch {}
+}
+
+const getSaldoP  = id => allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed').reduce((a,s)=>a+s.nominal,0);
+const getJmlP    = id => allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed').length;
+const getLastP   = id => { const l=allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed'); return l.length?l.sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0))[0].tglInput:null; };
+const hasPendP   = id => allSetoran.some(s=>s.pesertaId===id&&s.status==='pending');
+
+function renderPendingList(pending) {
+  const el = document.getElementById('adm-pending-list');
+  if (!pending.length) { el.innerHTML='<div class="empty-state"><div class="ei">✅</div><p>Tidak ada setoran pending</p></div>'; return; }
+  el.innerHTML = pending.sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0)).map(s=>`
+    <div class="pending-item" id="pi-${s.id}">
+      <div class="pi-header">
+        <div>
+          <div class="pi-nama">${s.nama}</div>
+          <div class="pi-info">📞 ${s.hp} · 🏦 VA: ${s.nomorVA||'-'}</div>
+          <div class="pi-info">${tglFmt(s.tglInput)} · Transfer VA BSI</div>
+          ${s.catatan?`<div class="pi-info">📝 ${s.catatan}</div>`:''}
+        </div>
+        <div class="pi-nom">${rp(s.nominal)}</div>
+      </div>
+
+      <div class="rekon-box">
+        <div class="rekon-title">📝 Rekonsiliasi Bank</div>
+        <input type="text" class="form-input" id="rn-${s.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px">
+        <input type="text" class="form-input" id="rw-${s.id}" placeholder="Waktu masuk (misal: 02/06 14:35)" style="margin-bottom:8px;font-size:12px">
+        <input type="text" class="form-input" id="rt-${s.id}" placeholder="Alasan tolak (isi jika ditolak)" style="margin-bottom:8px;font-size:12px">
+        <div style="display:flex;gap:8px">
+          <button class="btn-confirm" onclick="konfirmasi('${s.id}',true)">✅ Dana Masuk</button>
+          <button class="btn-reject"  onclick="konfirmasi('${s.id}',false)">❌ Tolak</button>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+function renderPesertaList() {
+  const el = document.getElementById('adm-peserta-list');
+  let list  = [...allPeserta];
+  if (adminFilter==='va-belum')    list=list.filter(p=>!p.nomorVA);
+  else if (adminFilter==='va-ok')  list=list.filter(p=>!!p.nomorVA);
+  else if (adminFilter==='aktif')  list=list.filter(p=>getSaldoP(p.id)>0);
+  else if (adminFilter==='belum')  list=list.filter(p=>getSaldoP(p.id)===0);
+  else if (adminFilter==='khidmah')    list=list.filter(p=>p.jenis?.includes('Khidmah'));
+  else if (adminFilter==='istiqomah')  list=list.filter(p=>p.jenis?.includes('Istiqomah'));
+  if (adminSort==='saldo-desc')    list.sort((a,b)=>getSaldoP(b.id)-getSaldoP(a.id));
+  else if (adminSort==='saldo-asc')    list.sort((a,b)=>getSaldoP(a.id)-getSaldoP(b.id));
+  else if (adminSort==='pct-desc')     list.sort((a,b)=>pct(getSaldoP(b.id),b.targetNominal||3500000)-pct(getSaldoP(a.id),a.targetNominal||3500000));
+  else if (adminSort==='nama')         list.sort((a,b)=>a.nama.localeCompare(b.nama));
+  else if (adminSort==='terbaru')      list.sort((a,b)=>(b.tglDaftar?.seconds||0)-(a.tglDaftar?.seconds||0));
+  if (!list.length) { el.innerHTML='<div class="empty-state"><div class="ei">🔍</div><p>Tidak ada peserta dengan filter ini</p></div>'; return; }
+  el.innerHTML = list.map(p => {
+    const saldo=getSaldoP(p.id), targetP=p.targetNominal||3500000, pc2=pct(saldo,targetP);
+    const jml=getJmlP(p.id), last=getLastP(p.id), pend=hasPendP(p.id);
+    const vaBadge = p.nomorVA
+      ? `<span class="badge badge-green">🏦 ${p.nomorVA}</span>`
+      : `<span class="badge badge-red">⚠️ Belum VA</span>`;
+    return `<div class="peserta-card" onclick="showDetail('${p.id}')">
+      <div class="pc-top">
+        <div class="avatar">${p.nama.charAt(0).toUpperCase()}</div>
+        <div style="flex:1;min-width:0">
+          <div class="p-nama">${p.nama} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div>
+          <div class="p-sub">📞 ${p.hp}</div>
+          <div class="p-sub">🎯 Target: ${rp(targetP)}</div>
+          <div style="margin-top:3px">${vaBadge}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div class="p-saldo">${rp(saldo)}</div>
+          <div class="p-pct">${pc2}%</div>
+        </div>
+      </div>
+      <div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa">
+        <span>${jml}x setor</span>
+        <span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span>
+      </div>
+      <div style="text-align:right;margin-top:5px;font-size:11px;color:var(--emas)">Tap untuk detail →</div>
+    </div>`;
+  }).join('');
+}
+
+window.setFilter = f => { adminFilter=f; document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===f)); renderPesertaList(); };
+window.setSort   = s => { adminSort=s; renderPesertaList(); };
+
+window.showDetail = function(id) {
+  detailId=id; adminView='detail';
+  document.getElementById('adm-list-view').style.display='none';
+  document.getElementById('adm-detail').style.display='block';
+  renderDetail();
+};
+window.backToList = function() {
+  adminView='list'; detailId=null;
+  document.getElementById('adm-detail').style.display='none';
+  document.getElementById('adm-list-view').style.display='block';
+};
+
+function renderDetail() {
+  const p = allPeserta.find(x=>x.id===detailId);
+  if (!p) return;
+  const setoranP  = allSetoran.filter(s=>s.pesertaId===p.id).sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
+  const confirmed = setoranP.filter(s=>s.status==='confirmed');
+  const pending   = setoranP.filter(s=>s.status==='pending');
+  const saldo   = confirmed.reduce((a,s)=>a+s.nominal,0);
+  const targetP = p.targetNominal||3500000;
+  const pc      = pct(saldo, targetP);
+  document.getElementById('detail-content').innerHTML = `
+    <div class="saldo-card" style="margin-bottom:12px">
+      <div class="s-nama">${p.nama}</div>
+      <div class="s-hp">📞 ${p.hp}</div>
+      <div class="s-jenis">${p.jenis}</div>
+      <span class="s-angka">${rp(saldo)}</span>
+      <div class="s-label">Saldo Dikonfirmasi · ${confirmed.length}x setor</div>
+      <div class="s-progress"><div class="s-pfill" style="width:${pc}%"></div></div>
+      <div class="s-pct">${pc}%</div>
+      <div class="s-target">dari target pribadi ${rp(targetP)}</div>
+    </div>
+
+    <div class="card" style="border:${p.nomorVA?'1px solid rgba(201,168,76,.2)':'2px solid #e53935'}">
+      <div class="card-title">🏦 Virtual Account BSI</div>
+      ${p.nomorVA
+        ? `<div class="va-assigned"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI</div>
+           <div class="va-assigned-num">${p.nomorVA}</div></div>
+           <div style="display:flex;gap:8px;margin-top:8px">
+             <input type="text" class="form-input" id="va-inp-${p.id}" value="${p.nomorVA}" style="font-size:13px">
+             <button class="btn btn-outline btn-sm" onclick="simpanVA('${p.id}')">Ubah</button>
+           </div>`
+        : `<div style="background:#fde8e8;border-radius:10px;padding:12px;margin-bottom:12px;font-size:12px;color:#c62828">⚠️ Belum ada No. VA. Input sekarang.</div>
+           <div class="form-group"><label class="form-label">Input No. VA BSI</label>
+           <input type="text" class="form-input" id="va-inp-${p.id}" placeholder="Contoh: 8809012345678"></div>
+           <button class="btn btn-primary" onclick="simpanVA('${p.id}')">💾 Simpan No. VA</button>`}
+    </div>
+
+    <div class="card">
+      <div class="card-title">🎯 Ubah Target Nominal</div>
+      <div style="display:flex;gap:8px">
+        <div style="flex:1;position:relative">
+          <span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--hijau);font-weight:700">Rp</span>
+          <input type="number" class="form-input" id="target-inp-${p.id}" value="${targetP}" style="padding-left:36px;font-size:13px">
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="simpanTargetPeserta('${p.id}')">Simpan</button>
+      </div>
+    </div>
+
+    ${pending.length?`<div class="pending-notice" style="display:block;margin-bottom:12px">⏳ ${pending.length} setoran pending (${rp(pending.reduce((a,s)=>a+s.nominal,0))})</div>`:''}
+
+    <div class="card">
+      <div class="card-title">📋 Riwayat Setoran</div>
+      ${setoranP.length ? setoranP.map(s => {
+        const badge = s.status==='confirmed'?'<span class="badge badge-green">✅</span>'
+          :s.status==='rejected'?'<span class="badge badge-red">❌</span>'
+          :'<span class="badge badge-yellow">⏳</span>';
+        return `<div class="s-detail-item">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div>
+              <div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(s.nominal)} ${badge}</div>
+              <div style="font-size:11px;color:#888">${tglFull(s.tglInput)} · Transfer VA BSI</div>
+              ${s.catatan?`<div style="font-size:11px;color:#888">📝 ${s.catatan}</div>`:''}
+              ${s.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${s.rekonNama} · ${s.rekonWaktu||''}</div>`:''}
+              ${s.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${s.alasanTolak}</div>`:''}
+            </div>
+
+          </div>
+          ${s.status==='pending'?`<div class="rekon-box" style="margin-top:8px">
+            <input type="text" class="form-input" id="rn-${s.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px">
+            <input type="text" class="form-input" id="rw-${s.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px">
+            <input type="text" class="form-input" id="rt-${s.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px">
+            <div style="display:flex;gap:8px">
+              <button class="btn-confirm" onclick="konfirmasi('${s.id}',true)">✅ Dana Masuk</button>
+              <button class="btn-reject" onclick="konfirmasi('${s.id}',false)">❌ Tolak</button>
+            </div>
+          </div>`:''}
+        </div>`;
+      }).join('') : '<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}
+    </div>
+    <button class="btn btn-outline" onclick="exportPesertaCSV('${p.id}')" style="margin-bottom:10px">📤 Export CSV Peserta Ini</button>
+    ${currentAdmin?.role==='superadmin' ? `
+    <div style="border-top:2px dashed #fde8e8;padding-top:14px;margin-top:4px">
+      <button class="btn" onclick="hapusPeserta('${p.id}','${p.nama}')" style="background:#fde8e8;color:#c62828;border:1.5px solid #ef9a9a;width:100%;font-weight:700">🗑️ Hapus Peserta Ini</button>
+      <div style="font-size:10px;color:#e57373;margin-top:5px;text-align:center">⚠️ Hanya Super Admin · Tindakan ini tidak dapat dibatalkan</div>
+    </div>` : ''}`;
+}
+
+window.hapusPeserta = async function(pid, nama) {
+  if (currentAdmin?.role !== 'superadmin') return alert('Hanya Super Admin yang bisa menghapus peserta.');
+  if (!confirm(`⚠️ Yakin hapus peserta "${nama}"?\n\nSemua data setoran peserta ini juga akan dihapus.\nTindakan ini TIDAK BISA dibatalkan.`)) return;
+  try {
+    // Hapus semua setoran peserta (soft delete)
+    const sSnap = await getDocs(query(collection(db,'setoran'), where('pesertaId','==',pid)));
+    for (const s of sSnap.docs) await updateDoc(doc(db,'setoran',s.id), {status:'deleted'});
+    // Hapus peserta (soft delete)
+    await updateDoc(doc(db,'peserta',pid), {deleted:true, deletedAt:serverTimestamp(), deletedBy:currentAdmin.nama});
+    showAlert('alert-adm-panel','success','✅ Peserta berhasil dihapus.');
+    // Refresh semua data
+    await loadPesertaCache();
+    allPeserta = allPeserta.filter(p => p.id !== pid);
+    allSetoran = allSetoran.filter(s => s.pesertaId !== pid);
+    backToList();
+    renderAdminPanel();
+  } catch(e) { alert('Gagal menghapus: '+e.message); }
+};
+
+window.simpanVA = async function(pid) {
+  const va = document.getElementById('va-inp-'+pid)?.value.trim();
+  if (!va) return alert('Nomor VA tidak boleh kosong.');
+  try {
+    await updateDoc(doc(db,'peserta',pid), { nomorVA:va, assignOleh:currentAdmin?.nama||'Admin', tglVA:serverTimestamp() });
+    showAlert('alert-adm-panel','success','✅ No. VA berhasil disimpan.');
+    await renderAdminPanel();
+    await loadPesertaCache();
+    if (adminView==='detail') renderDetail();
+  } catch(e) { alert('Gagal: '+e.message); }
+};
+
+window.simpanTargetPeserta = async function(pid) {
+  const v = parseInt(document.getElementById('target-inp-'+pid)?.value);
+  if (!v||v<100000) return alert('Target minimal Rp 100.000.');
+  try {
+    await updateDoc(doc(db,'peserta',pid), { targetNominal:v });
+    showAlert('alert-adm-panel','success','✅ Target peserta diperbarui: '+rp(v));
+    await renderAdminPanel();
+    if (adminView==='detail') renderDetail();
+  } catch(e) { alert('Gagal: '+e.message); }
+};
+
+window.konfirmasi = async function(sid, approve) {
+  const alasan    = document.getElementById('rt-'+sid)?.value.trim();
+  const rekonNama = document.getElementById('rn-'+sid)?.value.trim();
+  const rekonWaktu= document.getElementById('rw-'+sid)?.value.trim();
+  if (!approve && !alasan && !confirm('Tolak tanpa alasan?')) return;
+  try {
+    await updateDoc(doc(db,'setoran',sid), {
+      status: approve ? 'confirmed' : 'rejected',
+      tglKonfirmasi: serverTimestamp(),
+      konfirmasiOleh: currentAdmin?.nama||'Admin',
+      ...(alasan    && {alasanTolak:alasan}),
+      ...(rekonNama && {rekonNama}),
+      ...(rekonWaktu&& {rekonWaktu}),
+    });
+    document.getElementById('pi-'+sid)?.remove();
+    showAlert('alert-adm-panel', approve?'success':'error', approve?'✅ Setoran dikonfirmasi!':'❌ Setoran ditolak.');
+    await renderAdminPanel();
+    if (adminView==='detail') renderDetail();
+  } catch(e) { showAlert('alert-adm-panel','error','Gagal: '+e.message); }
+};
+
+window.simpanEstimasi = async function() {
+  const v = document.getElementById('adm-estimasi').value.trim();
+  if (!v) return;
+  await setSetting('estimasi', v);
+  showAlert('alert-adm-panel','success','✅ Info estimasi harga diperbarui.');
+};
+
+// ============================================================
+// EDIT KONTAK ADMIN
+// ============================================================
+const DEFAULT_KONTAK = JSON.stringify([
+  { nama: 'Aynur', hp: '6282139691445' },
+  { nama: 'Chandra', hp: '6285733844255' }
+]);
+
+async function loadKontakEditor() {
+  const saved = await getSetting('kontak_admin', DEFAULT_KONTAK);
+  const list = JSON.parse(saved);
+  const container = document.getElementById('kontak-editor-list');
+  if (!container) return;
+  container.innerHTML = list.map((k,i) => `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;padding:10px;background:#f9f9f9;border-radius:8px;border:1px solid #e0e0e0">
+      <div>
+        <label class="form-label" style="font-size:11px">Nama</label>
+        <input class="form-input" id="kontak-nama-${i}" value="${k.nama}" style="font-size:13px;padding:7px 10px">
+      </div>
+      <div>
+        <label class="form-label" style="font-size:11px">No HP (tanpa +, tanpa strip)</label>
+        <input class="form-input" id="kontak-hp-${i}" value="${k.hp}" style="font-size:13px;padding:7px 10px" placeholder="628xxx">
+      </div>
+    </div>
+  `).join('');
+}
+
+window.simpanKontak = async function() {
+  const saved = await getSetting('kontak_admin', DEFAULT_KONTAK);
+  const list = JSON.parse(saved);
+  const hasil = list.map((_,i) => ({
+    nama: document.getElementById(`kontak-nama-${i}`).value.trim(),
+    hp: document.getElementById(`kontak-hp-${i}`).value.trim().replace(/\D/g,'')
+  })).filter(k => k.nama && k.hp);
+  await setSetting('kontak_admin', JSON.stringify(hasil));
+  await renderKontakDynamic();
+  showAlert('alert-kontak-editor','success','✅ Kontak admin berhasil diperbarui.');
+};
+
+async function renderKontakDynamic() {
+  const saved = await getSetting('kontak_admin', DEFAULT_KONTAK);
+  const list = JSON.parse(saved);
+
+  // Update kontak box di dashboard
+  const kontakBox = document.getElementById('kontak-dynamic');
+  if (kontakBox) {
+    kontakBox.innerHTML = list.map(k => `
+      <div class="kontak-item">
+        <div style="font-size:20px">📱</div>
+        <div>
+          <div class="kontak-nama">${k.nama}</div>
+          <a href="https://wa.me/${k.hp}" target="_blank" class="kontak-no kontak-no-link">+${k.hp.replace(/^62/,'62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // Update kontak di sukses daftar
+  const suksesCont = document.getElementById('kontak-sukses-dynamic');
+  if (suksesCont) {
+    suksesCont.innerHTML = list.map(k =>
+      `<a href="https://wa.me/${k.hp}" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 ${k.nama}: +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>`
+    ).join('');
+  }
+
+  // Update kontak di pesan setor
+  const setorCont = document.getElementById('kontak-setor-dynamic');
+  if (setorCont) {
+    setorCont.innerHTML = list.map(k =>
+      `<strong>${k.nama} +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</strong>`
+    ).join(' atau ');
+  }
+}
+
+// Default S&K teks
+// ============================================================
+// AKSES ADMIN TERSEMBUNYI
+// ============================================================
+let axpertTapCount = 0, axpertTimer = null;
+window.aksesAdmin = function() {
+  axpertTapCount++;
+  clearTimeout(axpertTimer);
+  axpertTimer = setTimeout(() => { axpertTapCount = 0; }, 2000);
+  if (axpertTapCount >= 3) {
+    axpertTapCount = 0;
+    const btn = document.getElementById('nav-admin-btn');
+    btn.style.display = 'flex';
+    showPage('admin');
+    // Sembunyikan lagi setelah logout
+  }
+};
+
+
+// ============================================================
+const DEFAULT_PAKET = [
+  { icon:'🐑', nama:'Kambing/Domba', harga:1500000 },
+  { icon:'🐑', nama:'Kambing/Domba', harga:2500000 },
+  { icon:'🐑', nama:'Kambing/Domba', harga:3500000 },
+  { icon:'🐑', nama:'Kambing/Domba', harga:4500000 },
+  { icon:'🐄', nama:'Patungan Sapi',  harga:3500000 },
+];
+
+async function loadPaketSetting() {
+  const saved = await getSetting('paket_tabungan', JSON.stringify(DEFAULT_PAKET));
+  const paket = JSON.parse(saved);
+  const container = document.getElementById('paket-setting-list');
+  if (!container) return;
+  container.innerHTML = paket.map((p,i) => `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;background:var(--krem);border-radius:9px;padding:8px 10px;border:1px solid var(--krem-dark)">
+      <input type="text" value="${p.icon}" id="paket-icon-${i}" style="width:36px;text-align:center;font-size:18px;padding:4px;border:1px solid var(--krem-dark);border-radius:6px;background:white">
+      <input type="text" value="${p.nama}" id="paket-nama-${i}" class="form-input" style="flex:1;font-size:13px" placeholder="Nama paket">
+      <div style="position:relative">
+        <span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:11px;color:#888;font-weight:600">Rp</span>
+        <input type="number" value="${p.harga}" id="paket-harga-${i}" class="form-input" style="padding-left:28px;width:130px;font-size:13px" placeholder="Harga">
+      </div>
+    </div>`).join('');
+}
+
+window.simpanPaketSetting = async function() {
+  const saved = await getSetting('paket_tabungan', JSON.stringify(DEFAULT_PAKET));
+  const paket = JSON.parse(saved);
+  const hasil = paket.map((_,i) => ({
+    icon: document.getElementById(`paket-icon-${i}`)?.value || '🐑',
+    nama: document.getElementById(`paket-nama-${i}`)?.value.trim() || '',
+    harga: parseInt(document.getElementById(`paket-harga-${i}`)?.value) || 0,
+  }));
+  await setSetting('paket_tabungan', JSON.stringify(hasil));
+  showAlert('alert-paket-setting','success','✅ Paket tabungan berhasil diperbarui.');
+  await renderPaketDaftar();
+};
+
+async function renderPaketDaftar() {
+  const saved = await getSetting('paket_tabungan', JSON.stringify(DEFAULT_PAKET));
+  const paket = JSON.parse(saved);
+  const container = document.querySelector('.paket-list');
+  if (!container) return;
+  container.innerHTML = paket.map((p,i) => {
+    const isSapi = p.nama.toLowerCase().includes('sapi');
+    return `<div class="paket-list-item${isSapi?' paket-list-sapi':''}" onclick="pilihPaketBaru(this,'${p.nama} · Rp ${Number(p.harga).toLocaleString('id-ID')}',${p.harga})">
+      <span class="paket-list-icon">${p.icon}</span>
+      <span class="paket-list-nama">${p.nama}</span>
+      <span class="paket-list-harga">Rp ${Number(p.harga).toLocaleString('id-ID')}</span>
+      <span class="paket-list-check">✓</span>
+    </div>`;
+  }).join('');
+}
+
+const DEFAULT_SK = `1. Program Tabung Qurban diperuntukkan bagi peserta yang berencana memilih dan membeli hewan qurban melalui Ar Ra'i Farm untuk Idul Adha 1448 H, yang diperkirakan berlangsung pada Mei 2027.
+2. Peserta dapat memilih paket dan nominal setoran tabungan sesuai pilihan yang tersedia.
+3. Tim Ar Ra'i Farm akan memberikan pengingat secara berkala sesuai jadwal menabung peserta.
+4. Hewan qurban dapat disalurkan sendiri oleh peserta atau diamanahkan kepada Ar Ra'i Farm untuk disalurkan ke wilayah minim pequrban, daerah tertinggal, daerah terdampak bencana, atau wilayah yang mengalami keterbatasan distribusi daging qurban.
+5. Harga hewan qurban sudah termasuk biaya distribusi untuk wilayah Surabaya, Sidoarjo, Gresik, dan Mojokerto. Penyaluran di luar wilayah tersebut dapat dikenakan biaya tambahan.
+6. Peserta dapat mengubah paket atau nominal setoran tabungan paling lambat H-30 Idul Adha dengan melakukan konfirmasi kepada admin.
+7. Saldo tabungan tidak dapat ditarik selama periode menabung.
+8. Apabila sampai H-7 Idul Adha saldo belum mencapai target, peserta dapat memilih salah satu opsi berikut:
+A. Menambah kekurangan saldo agar dapat membeli hewan qurban sesuai pilihan;
+B. Memilih hewan atau program sedekah daging sesuai saldo yang tersedia;
+C. Melanjutkan saldo tabungan untuk program qurban tahun berikutnya; atau
+D. Mengajukan pengembalian saldo tabungan.
+9. Setoran dilakukan melalui Virtual Account Bank Syariah Indonesia atas nama atau nomor identitas masing-masing peserta. Peserta dapat memantau saldo tabungan secara berkala.
+10. Ar Ra'i Farm tidak mengenakan biaya administrasi selama masa menabung. Biaya transaksi yang dikenakan oleh bank atau penyedia layanan pembayaran, apabila ada, menjadi tanggungan peserta.
+11. Jenis dan harga hewan qurban mengikuti daftar hewan serta harga yang ditetapkan Ar Ra'i Farm pada periode Idul Adha 1448 H. Apabila terdapat selisih antara saldo tabungan dan harga hewan yang dipilih, peserta wajib melunasi kekurangannya sebelum batas waktu yang ditentukan.
+12. Ar Ra'i Farm dapat melakukan penyesuaian terhadap syarat dan ketentuan program apabila diperlukan, sepanjang tidak mengurangi saldo dan hak peserta yang telah terbentuk. Setiap perubahan akan diinformasikan melalui media komunikasi resmi Ar Ra'i Farm.
+13. Apabila terjadi perbedaan pendapat atau perselisihan dalam pelaksanaan program, para pihak sepakat menyelesaikannya terlebih dahulu secara musyawarah untuk mufakat.`;
+
+async function loadSKEditor() {
+  const sk = await getSetting('syarat_ketentuan', DEFAULT_SK);
+  document.getElementById('adm-sk').value = sk;
+}
+
+window.simpanSK = async function() {
+  const v = document.getElementById('adm-sk').value.trim();
+  if (!v) return showAlert('alert-sk-editor','error','S&K tidak boleh kosong.');
+  await setSetting('syarat_ketentuan', v);
+  showAlert('alert-sk-editor','success','✅ Syarat & Ketentuan berhasil diperbarui.');
+};
+
+async function renderSKModal() {
+  const sk = await getSetting('syarat_ketentuan', DEFAULT_SK);
+  const lines = sk.split('\n').filter(l => l.trim());
+  const modalBody = document.querySelector('#modal-sk .modal-body');
+  if (!modalBody) return;
+  let html = '<ol class="sk-list">';
+  let inSub = false;
+  lines.forEach(line => {
+    const trimmed = line.trim();
+    if (/^[A-D]\./.test(trimmed)) {
+      if (!inSub) { html += '<ol type="A" class="sk-sub">'; inSub = true; }
+      html += `<li>${trimmed.replace(/^[A-D]\.\s*/,'')}</li>`;
+    } else {
+      if (inSub) { html += '</ol></li>'; inSub = false; }
+      else if (html !== '<ol class="sk-list">') html += '</li>';
+      html += `<li>${trimmed.replace(/^\d+\.\s*/,'')}`;
+    }
+  });
+  if (inSub) html += '</ol></li>';
+  else html += '</li>';
+  html += '</ol>';
+  modalBody.innerHTML = html;
+}
+
+window.showAdmTab = function(tab, btn) {
+  document.querySelectorAll('[id^="adm-tab-"]').forEach(el=>el.style.display='none');
+  document.querySelectorAll('.adm-tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('adm-tab-'+tab).style.display='block';
+  btn.classList.add('active');
+  if (tab==='peserta') renderPesertaList();
+  if (tab==='setting') { loadSKEditor(); loadPaketSetting(); loadKontakEditor(); }
+  if (tab==='rekap') renderRekap();
+};
+
+function renderRekap() {
+  const container = document.getElementById('rekap-content');
+  if (!container) return;
+
+  // Kelompokkan peserta berdasarkan jenis paket
+  const kategori = { kambing:[], sapi:[], custom:[] };
+  allPeserta.forEach(p => {
+    const j = (p.jenis||'').toLowerCase();
+    const t = p.targetNominal || 0;
+    const saldo = allSetoran.filter(s=>s.pesertaId===p.id && s.status==='confirmed').reduce((a,s)=>a+s.nominal,0);
+    const item = { nama:p.nama, hp:p.hp, jenis:p.jenis||'-', target:t, saldo };
+    if (j.includes('sapi')) kategori.sapi.push(item);
+    else if (j.includes('custom') || j.includes('Custom')) kategori.custom.push(item);
+    else kategori.kambing.push(item);
+  });
+
+  // Hitung total per kategori
+  const totalUnit  = k => k.length;
+  const totalRp    = k => k.reduce((a,p)=>a+p.target,0);
+  const totalSetor = k => k.reduce((a,p)=>a+p.saldo,0);
+
+  const renderKategori = (label, icon, items, warna) => {
+    if (!items.length) return `<div class="card" style="border:1.5px solid var(--krem-dark)">
+      <div class="card-title">${icon} ${label}</div>
+      <div class="empty-state" style="padding:12px"><p>Belum ada peserta</p></div>
+    </div>`;
+
+    const rows = items.map(p => `
+      <div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed var(--krem-dark);font-size:12px">
+        <div style="width:20px;height:20px;border-radius:50%;background:${warna};color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">${p.nama.charAt(0).toUpperCase()}</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:700;color:var(--hijau);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.nama}</div>
+          <div style="font-size:10px;color:#888">${p.jenis}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div style="font-weight:700;color:var(--hijau-mid);font-size:11px">${rp(p.target)}</div>
+          <div style="font-size:10px;color:#888">Setor: ${rp(p.saldo)}</div>
+        </div>
+      </div>`).join('');
+
+    return `<div class="card" style="border:2px solid ${warna}">
+      <div class="card-title">${icon} ${label}</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px">
+        <div style="background:var(--krem-dark);border-radius:9px;padding:9px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:${warna}">${totalUnit(items)}</div>
+          <div style="font-size:10px;color:#888">Unit</div>
+        </div>
+        <div style="background:var(--krem-dark);border-radius:9px;padding:9px;text-align:center">
+          <div style="font-size:13px;font-weight:700;color:var(--hijau)">${rp(totalRp(items))}</div>
+          <div style="font-size:10px;color:#888">Total Target</div>
+        </div>
+        <div style="background:var(--krem-dark);border-radius:9px;padding:9px;text-align:center">
+          <div style="font-size:13px;font-weight:700;color:var(--hijau-mid)">${rp(totalSetor(items))}</div>
+          <div style="font-size:10px;color:#888">Terkumpul</div>
+        </div>
+      </div>
+      <div style="max-height:280px;overflow-y:auto">${rows}</div>
+    </div>`;
+  };
+
+  // Total keseluruhan
+  const semua = [...kategori.kambing, ...kategori.sapi, ...kategori.custom];
+  const grandTotal = `<div class="card" style="background:linear-gradient(135deg,var(--hijau),#0f2d1a)">
+    <div class="card-title" style="color:var(--emas2)">📊 Total Keseluruhan</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+      <div style="background:rgba(255,255,255,.1);border-radius:9px;padding:10px;text-align:center">
+        <div style="font-size:26px;font-weight:700;color:var(--emas)">${semua.length}</div>
+        <div style="font-size:10px;color:rgba(255,255,255,.7)">Total Peserta</div>
+      </div>
+      <div style="background:rgba(255,255,255,.1);border-radius:9px;padding:10px;text-align:center">
+        <div style="font-size:13px;font-weight:700;color:var(--emas)">${rp(totalRp(semua))}</div>
+        <div style="font-size:10px;color:rgba(255,255,255,.7)">Total Target</div>
+      </div>
+      <div style="background:rgba(255,255,255,.1);border-radius:9px;padding:10px;text-align:center">
+        <div style="font-size:13px;font-weight:700;color:#a8d8a8">${rp(totalSetor(semua))}</div>
+        <div style="font-size:10px;color:rgba(255,255,255,.7)">Total Terkumpul</div>
+      </div>
+    </div>
+  </div>`;
+
+  container.innerHTML =
+    grandTotal +
+    renderKategori('Kambing / Domba', '🐑', kategori.kambing, '#2D6A4F') +
+    renderKategori('Patungan Sapi',   '🐄', kategori.sapi,    '#C9A84C') +
+    renderKategori('Target Custom',   '✏️',  kategori.custom,  '#7B5EA7');
+}
+
+// Export rekap semua setoran
+window.exportCSV = async function() {
+  const snap = await getDocs(query(collection(db,'setoran'), where('status','==','confirmed')));
+  const confirmed = snap.docs.map(d=>d.data());
+  let csv='Nama,No HP,No VA BSI,Alamat,Paket,Target Nominal,Tanggal Setor,Nominal Setor,Nama Mutasi,Waktu Mutasi,Catatan,Dikonfirmasi Oleh\n';
+  confirmed.sort((a,b)=>a.nama.localeCompare(b.nama)).forEach(s=>{
+    const p=allPeserta.find(x=>x.id===s.pesertaId);
+    csv+=`"${s.nama}","${s.hp}","${s.nomorVA||''}","${p?.alamat||''}","${p?.jenis||''}","${p?.targetNominal||''}","${tglFmt(s.tglInput)}","${s.nominal}","${s.rekonNama||''}","${s.rekonWaktu||''}","${s.catatan||''}","${s.konfirmasiOleh||''}"\n`;
+  });
+  dlCSV(csv,'rekap-setoran-taqur.csv');
+};
+
+// Export rekap semua PESERTA (saldo terupdate)
+window.exportSemuaPeserta = function() {
+  if (!allPeserta.length) return alert('Belum ada data peserta.');
+  let csv = 'No,Nama,No HP,No VA BSI,Alamat,Paket Nabung,Target Nominal,Total Setoran,Jumlah Setor,Progress (%),Status VA,Tgl Daftar\n';
+  const sorted = [...allPeserta].sort((a,b)=>a.nama.localeCompare(b.nama));
+  sorted.forEach((p, i) => {
+    const confirmed = allSetoran.filter(s=>s.pesertaId===p.id&&s.status==='confirmed');
+    const totalSetor = confirmed.reduce((a,s)=>a+s.nominal,0);
+    const jmlSetor   = confirmed.length;
+    const progress   = p.targetNominal ? Math.round(totalSetor/p.targetNominal*100) : 0;
+    const statusVA   = p.nomorVA ? 'Sudah VA' : 'Belum VA';
+    csv += `"${i+1}","${p.nama}","${p.hp}","${p.nomorVA||'-'}","${p.alamat||'-'}","${p.jenis||''}","${p.targetNominal||0}","${totalSetor}","${jmlSetor}","${progress}%","${statusVA}","${tglFmt(p.tglDaftar)}"\n`;
+  });
+  dlCSV(csv, 'rekap-peserta-taqur.csv');
+};
+
+window.exportPesertaCSV = function(pid) {
+  const p    = allPeserta.find(x=>x.id===pid);
+  const list = allSetoran.filter(s=>s.pesertaId===pid&&s.status==='confirmed');
+  let csv = `TaQur — ${p?.nama||''}\nNo HP: ${p?.hp||''}\nNo VA BSI: ${p?.nomorVA||'-'}\nPaket: ${p?.jenis||''}\nTarget: ${rp(p?.targetNominal||0)}\n\nTanggal,Nominal,Nama Mutasi,Waktu Mutasi,Catatan\n`;
+  list.forEach(s=>{ csv+=`"${tglFmt(s.tglInput)}","${s.nominal}","${s.rekonNama||''}","${s.rekonWaktu||''}","${s.catatan||''}"\n`; });
+  csv+=`\nTotal Saldo,${list.reduce((a,s)=>a+s.nominal,0)}\nTarget,${p?.targetNominal||0}\n`;
+  dlCSV(csv,`taqur-${p?.nama?.replace(/\s+/g,'-')||'peserta'}.csv`);
+};
+
+function dlCSV(csv, fn) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8;'}));
+  a.download = fn; a.click();
+}
+
+// INIT
+loadDashboard();
+renderKontakDynamic();
+document.getElementById('setor-tgl').value = new Date().toISOString().split('T')[0];
+updateBadge();
+</script>
+
+<style>
+:root{--hijau:#1a4a2e;--hijau-mid:#2d6a44;--hijau-light:#3d8a5a;--emas:#c9a84c;--emas-light:#e8c97a;--emas-pale:#f5e6b8;--krem:#faf6ed;--krem-dark:#f0e8d0;--teks:#1a1a1a;--putih:#ffffff;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);min-height:100vh;}
+.header{background:linear-gradient(135deg,var(--hijau) 0%,#0f2d1a 60%,#1a4a2e 100%);position:relative;overflow:hidden;}
+.ticker-wrap{background:rgba(0,0,0,.25);border-bottom:1px solid rgba(201,168,76,.2);overflow:hidden;padding:6px 0;}
+.ticker-track{display:flex;width:max-content;animation:ticker 30s linear infinite;}
+.ticker-track:hover,.ticker-track:active{animation-play-state:paused;}
+.ticker-item{font-family:'Tajawal',sans-serif;font-size:11px;font-weight:600;letter-spacing:1px;color:var(--emas-light);white-space:nowrap;padding:0 6px;opacity:.95;}
+.ticker-sep{color:var(--emas);font-size:10px;padding:0 4px;opacity:.7;}
+@keyframes ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+.header::before{content:'';position:absolute;inset:0;background:url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='%23c9a84c' fill-opacity='0.06'%3E%3Cpath d='M30 0L60 30L30 60L0 30z'/%3E%3C/g%3E%3C/svg%3E");pointer-events:none;}
+.header-inner{position:relative;padding:18px 20px 10px;text-align:center;}
+.header-title-box{display:inline-block;padding:8px 20px 6px;margin-bottom:6px;position:relative;}
+.header-taqur{font-family:'Cinzel',serif;font-size:64px;font-weight:900;letter-spacing:10px;text-transform:uppercase;display:block;line-height:1;position:relative;background:linear-gradient(180deg,#f5e6a3 0%,#d4b86a 40%,#c8a84c 60%,#a07830 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 8px rgba(212,184,106,.4));}
+.header-taqur::after{content:'TAQUR';position:absolute;inset:0;font-family:'Cinzel',serif;font-size:64px;font-weight:900;letter-spacing:10px;text-transform:uppercase;background:linear-gradient(105deg,transparent 20%,rgba(255,255,255,0) 35%,rgba(255,248,210,.85) 50%,rgba(255,255,255,0) 65%,transparent 80%);background-size:300% 100%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:sheen 5s ease-in-out infinite;pointer-events:none;}
+@keyframes sheen{0%,30%{background-position:200% center;opacity:0}35%{opacity:1}65%{opacity:1}70%,100%{background-position:-100% center;opacity:0}}
+.header-tagline{font-family:'Cinzel',serif;font-size:13px;font-weight:700;letter-spacing:5px;text-transform:uppercase;color:#c8a84c;display:block;margin-top:8px;text-shadow:0 1px 8px rgba(212,184,106,.5);}
+.tagline-farm{color:#a8d8a8;text-shadow:0 1px 10px rgba(140,200,140,.4);}
+.header-badge{display:none;}
+.header h1{display:none;}
+.header-sub{font-size:11px;color:var(--emas-pale);opacity:.75;margin-bottom:12px;}
+.nav-tabs{display:flex;background:rgba(0,0,0,0.3);border-top:1px solid rgba(201,168,76,0.25);}
+.nav-tab{flex:1;padding:9px 1px;text-align:center;font-size:9px;font-weight:500;color:rgba(255,255,255,0.5);cursor:pointer;border:none;background:none;border-bottom:2px solid transparent;transition:all .25s;position:relative;}
+.nav-tab.active{color:var(--emas);border-bottom-color:var(--emas);background:rgba(201,168,76,0.08);}
+.nav-tab .ti{display:block;font-size:15px;margin-bottom:1px;}
+.nbadge{position:absolute;top:4px;right:50%;transform:translateX(12px);background:#e53935;color:#fff;font-size:9px;font-weight:700;border-radius:99px;padding:1px 5px;display:none;}
+.page{display:none;padding:13px;animation:fadeIn .3s ease;}
+.page.active{display:block;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.card{background:var(--putih);border-radius:14px;padding:15px;margin-bottom:11px;box-shadow:0 2px 10px rgba(26,74,46,.08);border:1px solid rgba(201,168,76,.15);}
+.card-title{font-family:'Amiri',serif;font-size:16px;font-weight:700;color:var(--hijau);margin-bottom:11px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.card-title::after{content:'';flex:1;height:1px;background:linear-gradient(to right,var(--emas-light),transparent);min-width:20px;}
+.stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:11px;}
+.stat-box{background:linear-gradient(135deg,var(--hijau),var(--hijau-mid));border-radius:12px;padding:12px 8px;text-align:center;color:white;}
+.stat-box.gold{background:linear-gradient(135deg,#8B6914,var(--emas));}
+.stat-box.amber{background:linear-gradient(135deg,#e65100,#ff8f00);}
+.stat-val{font-family:'Amiri',serif;font-size:17px;font-weight:700;color:var(--emas-light);display:block;}
+.stat-box.gold .stat-val,.stat-box.amber .stat-val{color:var(--putih);}
+.stat-lbl{font-size:9px;opacity:.8;margin-top:1px;}
+.progress-bar{height:9px;background:var(--krem-dark);border-radius:99px;overflow:hidden;border:1px solid rgba(201,168,76,.2);}
+.progress-fill{height:100%;background:linear-gradient(to right,var(--hijau-mid),var(--emas));border-radius:99px;transition:width .8s;min-width:4px;}
+.progress-label{display:flex;justify-content:space-between;font-size:11px;color:var(--hijau-mid);margin-bottom:5px;font-weight:500;}
+.progress-wrap{margin:8px 0 4px;}
+.ayat-box{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:14px;padding:15px;text-align:center;position:relative;overflow:hidden;margin-bottom:11px;}
+.ayat-box::before{content:'❝';position:absolute;top:8px;left:12px;font-size:36px;color:var(--emas);opacity:.2;font-family:serif;}
+.ayat-text{font-family:'Amiri',serif;font-size:13px;color:var(--emas-pale);font-style:italic;line-height:1.7;}
+.ayat-source{font-size:11px;color:var(--emas);margin-top:5px;}
+.top-item{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--krem-dark);}
+.top-item:last-child{border-bottom:none;}
+.top-rank{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;}
+.rank-1{background:linear-gradient(135deg,#FFD700,#FFA500);color:#5a3700;}
+.rank-2{background:linear-gradient(135deg,#C0C0C0,#A0A0A0);color:#3a3a3a;}
+.rank-3{background:linear-gradient(135deg,#CD7F32,#A0522D);color:#fff;}
+.rank-n{background:var(--krem-dark);color:#888;}
+.top-info{flex:1;min-width:0;}
+.top-nama{font-weight:700;font-size:13px;color:var(--hijau);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.top-jenis{font-size:10px;color:#888;}
+.top-saldo{text-align:right;flex-shrink:0;}
+.top-nom{font-family:'Amiri',serif;font-size:13px;font-weight:700;color:var(--hijau-mid);}
+.top-pct{font-size:10px;color:var(--emas);}
+.mini-bar{height:3px;background:var(--krem-dark);border-radius:99px;overflow:hidden;margin-top:3px;}
+.mini-fill{height:100%;background:linear-gradient(to right,var(--hijau-mid),var(--emas));border-radius:99px;}
+.see-all{text-align:center;padding:8px;font-size:12px;color:var(--emas);font-weight:600;cursor:pointer;border-top:1px solid var(--krem-dark);margin-top:4px;}
+.form-group{margin-bottom:11px;}
+.form-label{display:block;font-size:12px;font-weight:700;color:var(--hijau);margin-bottom:5px;}
+.form-input,.form-select{width:100%;padding:10px 12px;border:1.5px solid var(--krem-dark);border-radius:10px;font-family:'Tajawal',sans-serif;font-size:14px;color:var(--teks);background:var(--krem);outline:none;transition:border-color .2s;}
+.form-input:focus,.form-select:focus{border-color:var(--emas);background:var(--putih);}
+.form-select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%231a4a2e' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px;}
+.paket-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:11px;}
+.paket-card{border:2px solid var(--krem-dark);border-radius:12px;padding:12px;cursor:pointer;transition:all .2s;text-align:center;}
+.paket-card.selected{border-color:var(--emas);background:var(--emas-pale);}
+.paket-name{font-family:'Amiri',serif;font-size:14px;font-weight:700;color:var(--hijau);margin-bottom:4px;}
+.paket-detail{font-size:10px;color:#666;line-height:1.6;}
+.paket-list{border:1.5px solid var(--krem-dark);border-radius:12px;overflow:hidden;margin-bottom:10px;}
+.paket-list-item{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--krem-dark);cursor:pointer;transition:background .15s;background:var(--putih);}
+.paket-list-item:last-child{border-bottom:none;}
+.paket-list-item:active,.paket-list-item.selected{background:var(--emas-pale);}
+.paket-list-item.selected{border-left:3px solid var(--hijau);}
+.paket-list-sapi{background:#fffde7;}
+.paket-list-sapi.selected{background:#fff8e1;}
+.paket-list-icon{font-size:18px;flex-shrink:0;}
+.paket-list-nama{flex:1;font-size:13px;font-weight:600;color:var(--hijau);}
+.paket-list-harga{font-family:'Amiri',serif;font-size:14px;font-weight:700;color:var(--hijau-mid);}
+.paket-list-check{font-size:14px;color:var(--hijau);font-weight:700;opacity:0;transition:opacity .2s;margin-left:6px;}
+.paket-list-item.selected .paket-list-check{opacity:1;}
+.custom-nominal-wrap{background:var(--krem-dark);border-radius:10px;padding:11px 12px;border:1.5px dashed rgba(201,168,76,.4);margin-bottom:4px;}
+.custom-nominal-label{font-size:12px;font-weight:600;color:var(--hijau);}
+.target-input-wrap{position:relative;}
+.target-input-wrap .rp-prefix{position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--hijau);font-weight:700;}
+.target-input-wrap .form-input{padding-left:36px;}
+.estimasi-box{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:10px;padding:11px 13px;margin-top:8px;}
+.estimasi-title{font-size:10px;color:var(--emas);font-weight:700;letter-spacing:.5px;margin-bottom:4px;}
+.estimasi-text{font-size:12px;color:rgba(255,255,255,.85);line-height:1.6;}
+.btn{width:100%;padding:11px;border:none;border-radius:11px;font-family:'Tajawal',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .2s;}
+.btn-primary{background:linear-gradient(135deg,var(--hijau),var(--hijau-mid));color:var(--emas-light);box-shadow:0 4px 12px rgba(26,74,46,.25);}
+.btn-gold{background:linear-gradient(135deg,#8B6914,var(--emas));color:var(--putih);box-shadow:0 4px 12px rgba(201,168,76,.3);}
+.btn-outline{background:transparent;border:1.5px solid var(--hijau);color:var(--hijau);}
+.btn-confirm{flex:1;background:linear-gradient(135deg,#2e7d32,#43a047);color:#fff;padding:10px;border:none;border-radius:9px;font-family:'Tajawal',sans-serif;font-size:12px;font-weight:700;cursor:pointer;}
+.btn-reject{flex:1;background:linear-gradient(135deg,#c62828,#e53935);color:#fff;padding:10px;border:none;border-radius:9px;font-family:'Tajawal',sans-serif;font-size:12px;font-weight:700;cursor:pointer;}
+.btn-sm{width:auto;padding:6px 14px;font-size:12px;}
+.btn-copy{background:linear-gradient(135deg,var(--hijau),var(--hijau-mid));color:var(--emas-light);border:none;border-radius:9px;padding:8px 16px;font-family:'Tajawal',sans-serif;font-size:12px;font-weight:700;cursor:pointer;width:100%;}
+.alert{padding:10px 12px;border-radius:9px;font-size:13px;margin-bottom:11px;display:none;}
+.alert.success{background:#e8f5e9;color:#2e7d32;border-left:3px solid #4caf50;}
+.alert.error{background:#fde8e8;color:#c62828;border-left:3px solid #f44336;}
+.alert.info{background:#e3f2fd;color:#1565c0;border-left:3px solid #2196f3;}
+.alert.show{display:block;}
+.hp-row{display:flex;gap:8px;margin-bottom:6px;}
+.hp-row .form-input{flex:1;}
+.hp-row button{width:auto;padding:10px 14px;font-size:13px;border-radius:10px;}
+.peserta-found{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#e8f5e9;border-radius:10px;border-left:3px solid #4caf50;}
+.avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--hijau-mid),var(--hijau-light));display:flex;align-items:center;justify-content:center;color:var(--emas-light);font-family:'Amiri',serif;font-size:16px;font-weight:700;flex-shrink:0;}
+.va-card{background:linear-gradient(135deg,#0a3d2e,#1a5a3e,#0f2d1a);border-radius:18px;padding:22px 18px;text-align:center;margin-bottom:12px;position:relative;overflow:hidden;}
+.va-bank{font-family:'Cinzel Decorative',serif;font-size:13px;color:var(--emas);letter-spacing:2px;margin-bottom:4px;}
+.va-label{font-size:11px;color:rgba(255,255,255,.6);margin-bottom:2px;}
+.va-label-sub{font-size:11px;color:var(--emas-light);opacity:.8;margin-bottom:14px;}
+.va-number{font-family:'Tajawal',sans-serif;font-size:24px;font-weight:700;color:var(--emas);letter-spacing:2px;margin-bottom:12px;word-break:break-all;}
+.va-owner{margin-top:14px;padding-top:14px;border-top:1px solid rgba(201,168,76,.2);}
+.va-steps{background:var(--putih);border-radius:14px;padding:14px;margin-bottom:12px;border:1px solid rgba(201,168,76,.2);}
+.va-step{display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px dashed var(--krem-dark);font-size:12px;}
+.va-step:last-child{border-bottom:none;}
+.vs-num{width:20px;height:20px;border-radius:50%;background:var(--hijau);color:var(--emas-light);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.va-warn-box{background:var(--emas-pale);border-radius:10px;padding:10px 12px;font-size:11px;color:#7a5c0a;border-left:3px solid var(--emas);margin-bottom:12px;}
+.sukses-box{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center;margin-top:12px;display:none;}
+.sukses-box .si{font-size:40px;margin-bottom:8px;}
+.sukses-box h3{font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px;}
+.sukses-box p{font-size:13px;color:rgba(255,255,255,.8);line-height:1.6;}
+.sukses-note{background:rgba(201,168,76,.15);border-radius:10px;padding:12px;margin-top:12px;font-size:12px;color:var(--emas-pale);border:1px solid rgba(201,168,76,.3);}
+.saldo-result{display:none;animation:fadeIn .3s ease;}
+.saldo-card{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:20px 16px;text-align:center;margin-bottom:11px;position:relative;overflow:hidden;}
+.saldo-card::before{content:'🐑';position:absolute;top:12px;right:14px;font-size:32px;opacity:.1;}
+.s-nama{font-family:'Amiri',serif;font-size:20px;color:var(--putih);margin-bottom:2px;}
+.s-hp{font-size:12px;color:var(--emas-light);margin-bottom:2px;}
+.s-jenis{font-size:11px;color:rgba(255,255,255,.6);margin-bottom:12px;}
+.s-angka{font-family:'Cinzel Decorative',serif;font-size:26px;color:var(--emas);display:block;margin-bottom:3px;}
+.s-label{font-size:11px;color:rgba(255,255,255,.6);}
+.s-progress{margin-top:12px;background:rgba(255,255,255,.1);border-radius:99px;height:7px;overflow:hidden;}
+.s-pfill{height:100%;background:linear-gradient(to right,var(--emas),#f5e6b8);border-radius:99px;transition:width 1s;}
+.s-pct{font-size:11px;color:var(--emas-light);margin-top:4px;}
+.s-target{font-size:10px;color:rgba(255,255,255,.5);margin-top:2px;}
+.pending-notice{background:rgba(255,193,7,.15);border:1px solid rgba(255,193,7,.4);border-radius:9px;padding:9px 11px;font-size:12px;color:#f9a825;}
+.history-item{display:flex;justify-content:space-between;align-items:flex-start;padding:9px 0;border-bottom:1px dashed var(--krem-dark);font-size:13px;gap:8px;}
+.history-item:last-child{border-bottom:none;}
+.h-tgl{color:#888;font-size:11px;margin-top:2px;}
+.h-nom{font-weight:700;color:var(--hijau-mid);white-space:nowrap;}
+.badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700;}
+.badge-green{background:#e8f5e9;color:#2e7d32;}
+.badge-yellow{background:#fff8e1;color:#f9a825;}
+.badge-red{background:#fde8e8;color:#c62828;}
+.admin-login{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:26px 18px;text-align:center;margin-bottom:11px;}
+.admin-login h2{font-family:'Amiri',serif;color:var(--emas-light);font-size:22px;margin-bottom:4px;}
+.admin-login p{color:rgba(255,255,255,.6);font-size:12px;margin-bottom:16px;}
+.admin-login .form-input{background:rgba(255,255,255,.1);border-color:rgba(201,168,76,.3);color:white;margin-bottom:9px;}
+.admin-login .form-input::placeholder{color:rgba(255,255,255,.4);}
+.admin-login .form-input:focus{border-color:var(--emas);background:rgba(255,255,255,.15);}
+.pending-item{background:var(--krem);border:1.5px solid rgba(201,168,76,.3);border-radius:13px;padding:13px;margin-bottom:9px;}
+.pi-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:9px;}
+.pi-nama{font-weight:700;font-size:14px;color:var(--hijau);}
+.pi-info{font-size:11px;color:#888;margin-top:2px;}
+.pi-nom{font-family:'Amiri',serif;font-size:16px;font-weight:700;color:var(--hijau-mid);}
+.rekon-box{background:var(--krem);border-radius:10px;padding:10px;margin-top:8px;border:1px dashed rgba(201,168,76,.3);}
+.rekon-title{font-size:11px;font-weight:700;color:var(--hijau);margin-bottom:6px;}
+.adm-tabs{display:flex;gap:6px;margin-bottom:11px;}
+.adm-tab-btn{flex:1;padding:8px 4px;border:1.5px solid var(--krem-dark);border-radius:9px;background:var(--putih);font-family:'Tajawal',sans-serif;font-size:11px;font-weight:600;color:#888;cursor:pointer;text-align:center;transition:all .2s;}
+.adm-tab-btn.active{background:var(--hijau);color:var(--emas-light);border-color:var(--hijau);}
+.filter-chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px;}
+.filter-btn{padding:5px 10px;border:1.5px solid var(--krem-dark);border-radius:99px;background:var(--putih);font-family:'Tajawal',sans-serif;font-size:11px;font-weight:600;color:#888;cursor:pointer;transition:all .2s;white-space:nowrap;}
+.filter-btn.active{background:var(--hijau);color:var(--emas-light);border-color:var(--hijau);}
+.sort-row{display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:12px;color:var(--hijau);}
+.sort-row select{flex:1;padding:6px 10px;border:1.5px solid var(--krem-dark);border-radius:9px;font-family:'Tajawal',sans-serif;font-size:12px;background:var(--krem);outline:none;}
+.detail-back{display:flex;align-items:center;gap:8px;padding:10px 0 14px;cursor:pointer;color:var(--hijau);font-weight:700;font-size:14px;}
+.target-info{background:var(--krem-dark);border-radius:9px;padding:10px 12px;font-size:12px;color:var(--hijau);margin-bottom:11px;border-left:3px solid var(--emas);}
+.target-info strong{display:block;font-size:13px;margin-bottom:2px;}
+.peserta-card{background:var(--krem);border:1px solid rgba(201,168,76,.2);border-radius:12px;padding:12px;margin-bottom:8px;cursor:pointer;transition:all .2s;}
+.peserta-card:active{transform:scale(.98);background:var(--emas-pale);}
+.pc-top{display:flex;align-items:flex-start;gap:10px;}
+.p-nama{font-weight:700;font-size:13px;color:var(--hijau);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.p-sub{font-size:11px;color:#888;margin-top:1px;}
+.p-saldo{font-family:'Amiri',serif;font-size:13px;font-weight:700;color:var(--hijau-mid);}
+.p-pct{font-size:10px;color:var(--emas);}
+.kontak-box{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:14px;padding:16px;margin-bottom:11px;}
+.kontak-title{font-family:'Amiri',serif;font-size:15px;color:var(--emas);margin-bottom:10px;text-align:center;}
+.kontak-item{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.1);}
+.kontak-item:last-child{border-bottom:none;}
+.kontak-nama{font-size:13px;font-weight:700;color:var(--putih);}
+.kontak-no{font-size:11px;color:var(--emas-light);}
+.kontak-no-link{text-decoration:underline;text-underline-offset:2px;cursor:pointer;}
+.kontak-link{text-decoration:none;cursor:pointer;transition:background .2s;border-radius:10px;padding:6px 8px;margin:-6px -8px;}
+.kontak-link:active{background:rgba(255,255,255,.1);}
+.va-assigned{background:linear-gradient(135deg,#e8f5e9,#f1f8e9);border-radius:12px;padding:14px;text-align:center;border:2px solid #4caf50;margin-bottom:10px;}
+.va-assigned-num{font-family:'Cinzel Decorative',serif;font-size:18px;color:var(--hijau);letter-spacing:2px;}
+.s-detail-item{padding:12px 0;border-bottom:1px solid var(--krem-dark);}
+.s-detail-item:last-child{border-bottom:none;}
+.empty-state{text-align:center;padding:22px 16px;color:#bbb;}
+.empty-state .ei{font-size:34px;margin-bottom:7px;}
+.empty-state p{font-size:13px;}
+.footer-note{text-align:center;font-size:11px;color:#aaa;padding:16px;}
+.sk-wrap{background:var(--krem-dark);border-radius:10px;padding:12px;margin-bottom:12px;border:1.5px solid rgba(201,168,76,.3);cursor:pointer;transition:border-color .2s,background .2s;}
+.sk-wrap:hover{border-color:var(--hijau);background:#f0f5f0;}
+.sk-check-label{display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:12px;color:#555;line-height:1.5;pointer-events:none;}
+.sk-check-label input[type=checkbox]{margin-top:2px;width:16px;height:16px;accent-color:var(--hijau);flex-shrink:0;cursor:pointer;pointer-events:auto;}
+.sk-check-label input[type=checkbox]:disabled{cursor:not-allowed;opacity:.4;}
+.sk-check-label input[type=checkbox]:disabled + span::before{content:'';}
+.sk-link{background:none;border:none;color:var(--hijau);font-weight:700;font-size:12px;text-decoration:underline;cursor:pointer;padding:0;font-family:'Tajawal',sans-serif;}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:999;align-items:flex-end;justify-content:center;}
+.modal-overlay.open{display:flex;}
+.modal-box{background:#fff;border-radius:20px 20px 0 0;width:100%;max-width:480px;max-height:88vh;display:flex;flex-direction:column;animation:slideUp .3s ease;}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal-header{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:20px 20px 0 0;padding:18px 18px 14px;position:relative;}
+.modal-title{font-family:'Amiri',serif;font-size:18px;color:var(--emas);font-weight:700;}
+.modal-subtitle{font-size:11px;color:rgba(255,255,255,.7);margin-top:2px;}
+.modal-close{position:absolute;top:14px;right:16px;background:rgba(255,255,255,.15);border:none;color:#fff;width:28px;height:28px;border-radius:50%;font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+.modal-body{overflow-y:auto;padding:16px 18px;flex:1;}
+.sk-list{padding-left:18px;margin:0;font-size:12px;color:#444;line-height:1.8;}
+.sk-list li{margin-bottom:10px;}
+.sk-sub{padding-left:16px;margin-top:6px;}
+.sk-sub li{margin-bottom:4px;}
+.modal-footer{padding:14px 18px;border-top:1px solid var(--krem-dark);display:flex;gap:8px;}
+.modal-footer .btn{flex:1;}
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="ticker-wrap">
+    <div class="ticker-track" id="ticker-track">
+      <span class="ticker-item">BAITUL MAAL KHATULISTIWA SIDOARJO</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">POSKU AL-FATIH SIDOARJO</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">JAZZAAR AL-FATIH</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">AR-RA'I FARM — Amanah, Sehat, Berkualitas</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">TAQUR : TABUNG QURBAN AR RA'I FARM</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">BAITUL MAAL KHATULISTIWA SIDOARJO</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">POSKU AL-FATIH SIDOARJO</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">JAZZAAR AL-FATIH</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">AR-RA'I FARM — Amanah, Sehat, Berkualitas</span><span class="ticker-sep">✦</span>
+      <span class="ticker-item">TAQUR : TABUNG QURBAN AR RA'I FARM</span><span class="ticker-sep">✦</span>
+    </div>
+  </div>
+  <div class="header-inner">
+    <div class="header-badge">TaQur — Tabung Qurban</div>
+    <h1>Tabung <span>Qurban</span></h1>
+    <div class="header-title-box">
+      <span class="header-taqur">TAQUR</span>
+      <span class="header-tagline">Tabungan Qurban<br><span class="tagline-farm">Ar-Ra'i Farm</span></span>
+    </div>
+  </div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" data-page="dashboard" onclick="showPage('dashboard')"><span class="ti">📊</span>Dashboard</button>
+    <button class="nav-tab" data-page="daftar"  onclick="showPage('daftar')"><span class="ti">📝</span>Daftar</button>
+    <button class="nav-tab" data-page="va"      onclick="showPage('va')"><span class="ti">🏦</span>No. VA</button>
+    <button class="nav-tab" data-page="setor"   onclick="showPage('setor')"><span class="ti">💰</span>Setor</button>
+    <button class="nav-tab" data-page="cek"     onclick="showPage('cek')"><span class="ti">🔍</span>Cek Saldo</button>
+    <button class="nav-tab" data-page="admin" id="nav-admin-btn" onclick="showPage('admin')" style="display:none"><span class="ti">🔐</span>Admin<span class="nbadge" id="badge-pending">0</span></button>
+  </div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="page-dashboard" class="page active">
+  <div class="stats-grid">
+    <div class="stat-box"><span class="stat-val" id="dash-peserta">—</span><div class="stat-lbl">Peserta</div></div>
+    <div class="stat-box gold"><span class="stat-val" id="dash-total">—</span><div class="stat-lbl">Total Dana</div></div>
+    <div class="stat-box amber"><span class="stat-val" id="dash-pct">—</span><div class="stat-lbl">Kolektif</div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">🎯 Progress Kolektif</div>
+    <div class="target-info"><strong id="dash-target-label">Memuat...</strong><span id="dash-target-sub"></span></div>
+    <div class="progress-wrap">
+      <div class="progress-label"><span id="dash-collected">Memuat...</span><span id="dash-pct2">—</span></div>
+      <div class="progress-bar"><div class="progress-fill" id="dash-bar" style="width:0%"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">🏆 Top 5 Penabung</div>
+    <div id="dash-top5"><div class="empty-state"><div class="ei">⏳</div><p>Memuat data...</p></div></div>
+    <div class="see-all" id="see-all-btn" style="display:none" onclick="showPage('admin')">Lihat semua peserta di Admin →</div>
+  </div>
+  <div class="kontak-box">
+    <div class="kontak-title">📞 Hubungi Kami</div>
+    <div id="kontak-dynamic">
+      <div class="kontak-item">
+        <div style="font-size:20px">📱</div>
+        <div>
+          <div class="kontak-nama">Aynur</div>
+          <a href="https://wa.me/6282139691445" target="_blank" class="kontak-no kontak-no-link">+62 821-3969-1445</a>
+        </div>
+      </div>
+      <div class="kontak-item">
+        <div style="font-size:20px">📱</div>
+        <div>
+          <div class="kontak-nama">Chandra</div>
+          <a href="https://wa.me/6285733844255" target="_blank" class="kontak-no kontak-no-link">+62 857-3384-4255</a>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="ayat-box">
+    <div class="ayat-text">"Dan dirikanlah shalat karena Tuhanmu; dan berqurbanlah."</div>
+    <div class="ayat-source">— QS. Al-Kautsar: 2</div>
+  </div>
+</div>
+
+<!-- DAFTAR -->
+<div id="page-daftar" class="page">
+  <div class="card">
+    <div class="card-title">📝 Formulir Pendaftaran TaQur</div>
+    <div class="alert" id="alert-daftar"></div>
+    <div class="form-group"><label class="form-label">Nama Lengkap *</label><input type="text" class="form-input" id="daftar-nama" placeholder="Masukkan nama lengkap"></div>
+    <div class="form-group">
+      <label class="form-label">No. WhatsApp * <span style="font-size:10px;color:var(--emas);font-weight:400">(kode unik Anda)</span></label>
+      <input type="tel" class="form-input" id="daftar-hp" placeholder="08xx-xxxx-xxxx">
+      <div style="font-size:11px;color:#888;margin-top:4px">📌 No. HP dipakai untuk setor & cek saldo. Pastikan benar.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Alamat Lengkap *</label>
+      <input type="text" class="form-input" id="daftar-alamat" placeholder="Contoh: Jl. Mawar No. 5, Kel. Sidokare, Kec. Sidoarjo">
+      <div style="font-size:11px;color:#888;margin-top:4px">📌 Isi dengan nama jalan, nomor rumah, kelurahan, dan kecamatan.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Pilih Paket Tabungan *</label>
+      <div class="paket-list">
+        <div class="paket-list-item" onclick="pilihPaketBaru(this,'Kambing/Domba · Rp 1.500.000',1500000)">
+          <span class="paket-list-icon">🐑</span>
+          <span class="paket-list-nama">Kambing/Domba</span>
+          <span class="paket-list-harga">Rp 1.500.000</span>
+          <span class="paket-list-check">✓</span>
+        </div>
+        <div class="paket-list-item" onclick="pilihPaketBaru(this,'Kambing/Domba · Rp 2.500.000',2500000)">
+          <span class="paket-list-icon">🐑</span>
+          <span class="paket-list-nama">Kambing/Domba</span>
+          <span class="paket-list-harga">Rp 2.500.000</span>
+          <span class="paket-list-check">✓</span>
+        </div>
+        <div class="paket-list-item" onclick="pilihPaketBaru(this,'Kambing/Domba · Rp 3.500.000',3500000)">
+          <span class="paket-list-icon">🐑</span>
+          <span class="paket-list-nama">Kambing/Domba</span>
+          <span class="paket-list-harga">Rp 3.500.000</span>
+          <span class="paket-list-check">✓</span>
+        </div>
+        <div class="paket-list-item" onclick="pilihPaketBaru(this,'Kambing/Domba · Rp 4.500.000',4500000)">
+          <span class="paket-list-icon">🐑</span>
+          <span class="paket-list-nama">Kambing/Domba</span>
+          <span class="paket-list-harga">Rp 4.500.000</span>
+          <span class="paket-list-check">✓</span>
+        </div>
+        <div class="paket-list-item paket-list-sapi" onclick="pilihPaketBaru(this,'Patungan Sapi · Rp 3.500.000',3500000)">
+          <span class="paket-list-icon">🐄</span>
+          <span class="paket-list-nama">Patungan Sapi</span>
+          <span class="paket-list-harga">Rp 3.500.000</span>
+          <span class="paket-list-check">✓</span>
+        </div>
+      </div>
+      <div class="custom-nominal-wrap">
+        <div class="custom-nominal-label">✏️ Atau masukkan target sendiri</div>
+        <div class="hp-row" style="margin-top:6px">
+          <div style="position:relative;flex:1">
+            <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:12px;color:#888;font-weight:600">Rp</span>
+            <input type="number" class="form-input" id="custom-target-input" placeholder="Contoh: 5000000" min="1" style="padding-left:32px" oninput="inputNominalCustom()">
+          </div>
+          <button class="btn btn-outline" onclick="terapkanNominalCustom()">Terapkan</button>
+        </div>
+        <div id="custom-hint" style="font-size:11px;color:var(--hijau-mid);margin-top:5px;display:none"></div>
+      </div>
+      <input type="hidden" id="daftar-jenis" value="">
+      <input type="hidden" id="daftar-target" value="">
+      <div id="paket-selected-info" style="display:none;margin-top:10px;background:var(--krem-dark);border-radius:9px;padding:10px 12px;font-size:12px;color:var(--hijau);border-left:3px solid var(--emas);">
+        ✅ Target dipilih: <strong id="paket-selected-label"></strong>
+      </div>
+      <div class="estimasi-box" style="margin-top:10px">
+        <div class="estimasi-title">💡 ESTIMASI HARGA HEWAN QURBAN</div>
+        <div class="estimasi-text" id="estimasi-text">Memuat info harga...</div>
+      </div>
+    </div>
+    <div class="sk-wrap" onclick="bukaModalSK()">
+      <label class="sk-check-label">
+        <input type="checkbox" id="setuju-sk" onchange="toggleBtnDaftar()" disabled onclick="event.stopPropagation()">
+        <span>Saya telah membaca dan menyetujui <strong>Syarat &amp; Ketentuan</strong> program Tabung Qurban Ar Ra'i Farm. <span style="color:var(--hijau);font-size:11px">(Klik untuk membaca)</span></span>
+      </label>
+      <div id="sk-hint" style="font-size:11px;color:#e65100;margin-top:5px;display:none">⚠️ Silakan baca Syarat &amp; Ketentuan terlebih dahulu.</div>
+    </div>
+    <button class="btn btn-primary" id="btn-daftar" onclick="daftarPeserta()" disabled style="opacity:.5;cursor:not-allowed">✅ Daftar Sekarang</button>
+  </div>
+  <div class="sukses-box" id="daftar-sukses">
+    <div class="si">🎉</div>
+    <h3>Pendaftaran Berhasil!</h3>
+    <p>Selamat bergabung dalam program TaQur Ar-Ra'i Farm.<br>Semoga Allah meridhoi niat qurban Anda.</p>
+    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong> khusus Anda.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
+  </div>
+  <div class="ayat-box" style="margin-top:12px">
+    <div class="ayat-text">"Tidak ada amalan anak Adam pada hari Nahr yang lebih dicintai Allah selain menyembelih hewan qurban."</div>
+    <div class="ayat-source">— HR. Tirmidzi</div>
+  </div>
+</div>
+
+<!-- NO VA -->
+<div id="page-va" class="page">
+  <div class="card">
+    <div class="card-title">🏦 Cek No. VA BSI Saya</div>
+    <div class="form-group">
+      <label class="form-label">No. HP Anda *</label>
+      <div class="hp-row">
+        <input type="tel" class="form-input" id="va-hp" placeholder="08xx-xxxx-xxxx" onkeydown="if(event.key==='Enter')cekVA()">
+        <button class="btn btn-primary" onclick="cekVA()">Cek</button>
+      </div>
+    </div>
+  </div>
+  <div class="alert" id="alert-va"></div>
+  <div id="va-result"></div>
+</div>
+
+<!-- SETOR -->
+<div id="page-setor" class="page">
+  <div class="card">
+    <div class="card-title">💰 Input Setoran TaQur</div>
+    <div class="alert" id="alert-setor"></div>
+    <div class="form-group">
+      <label class="form-label">No. HP Penabung * <span style="font-size:10px;color:var(--emas);font-weight:400">(kode unik)</span></label>
+      <div class="hp-row">
+        <input type="tel" class="form-input" id="setor-hp" placeholder="08xx-xxxx-xxxx">
+        <button class="btn btn-outline" onclick="cariPesertaSetor()">Cari</button>
+      </div>
+      <div id="setor-info" style="display:none;margin-top:6px"></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Jumlah Setoran (Rp) *</label>
+      <div style="position:relative">
+        <span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:#888;font-weight:600;pointer-events:none">Rp</span>
+        <input type="text" inputmode="numeric" class="form-input" id="setor-nominal" placeholder="0" style="padding-left:34px;font-weight:700;font-size:15px;letter-spacing:.5px" oninput="formatNominalSetor(this)">
+      </div>
+      <div id="setor-nominal-hint" style="font-size:11px;color:var(--hijau-mid);margin-top:4px;display:none"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Tanggal Setoran *</label><input type="date" class="form-input" id="setor-tgl"></div>
+    <div class="form-group"><label class="form-label">Catatan (opsional)</label><input type="text" class="form-input" id="setor-catatan" placeholder="Misal: setoran minggu ke-3"></div>
+    <div class="target-info">
+      ℹ️ Saldo akan terupdate setelah admin mengkonfirmasi dana telah masuk ke rekening.
+    </div>
+    <button class="btn btn-gold" id="btn-setor" onclick="inputSetoran()" style="margin-top:10px">📤 Kirim Setoran</button>
+  </div>
+</div>
+
+<!-- CEK SALDO -->
+<div id="page-cek" class="page">
+  <div class="card">
+    <div class="card-title">🔍 Cek Saldo TaQur</div>
+    <div class="form-group">
+      <label class="form-label">No. HP Anda *</label>
+      <div class="hp-row">
+        <input type="tel" class="form-input" id="cek-hp" placeholder="08xx-xxxx-xxxx" onkeydown="if(event.key==='Enter')cekSaldo()">
+        <button class="btn btn-primary" onclick="cekSaldo()">Cek</button>
+      </div>
+    </div>
+  </div>
+  <div class="alert" id="alert-cek"></div>
+  <div class="saldo-result" id="saldo-result">
+    <div class="saldo-card">
+      <div class="s-nama"  id="res-nama">—</div>
+      <div class="s-hp"    id="res-hp">—</div>
+      <div class="s-jenis" id="res-jenis">—</div>
+      <span class="s-angka" id="res-saldo">Rp 0</span>
+      <div class="s-label">Total Saldo Dikonfirmasi</div>
+      <div class="s-progress"><div class="s-pfill" id="res-bar" style="width:0%"></div></div>
+      <div class="s-pct"   id="res-pct">0%</div>
+      <div class="s-target" id="res-target"></div>
+      <div class="pending-notice" id="res-pending" style="display:none;margin-top:10px"></div>
+    </div>
+    <div class="card"><div class="card-title">📋 Riwayat Setoran</div><div id="res-history"></div></div>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div id="page-admin" class="page">
+  <div id="admin-login-wrap">
+    <div class="admin-login">
+      <h2>🔐 Admin TaQur</h2>
+      <p>Khusus Admin TaQur Ar-Ra'i Farm</p>
+      <input type="text"     class="form-input" id="admin-user" placeholder="Username">
+      <input type="password" class="form-input" id="admin-pass" placeholder="Password" onkeydown="if(event.key==='Enter')adminLogin()">
+      <button class="btn btn-gold" style="margin-top:4px" onclick="adminLogin()">Masuk</button>
+      <div class="alert" id="alert-admin" style="margin-top:10px;text-align:left"></div>
+    </div>
+  </div>
+  <div id="admin-panel" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div id="adm-welcome" style="font-size:12px;font-weight:700;color:var(--hijau)"></div>
+      <button class="btn btn-outline btn-sm" onclick="adminLogout()">Keluar</button>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-box"><span class="stat-val" id="adm-peserta">—</span><div class="stat-lbl">Peserta</div></div>
+      <div class="stat-box gold"><span class="stat-val" id="adm-total">—</span><div class="stat-lbl">Total Dana</div></div>
+      <div class="stat-box amber"><span class="stat-val" id="adm-pending-stat">—</span><div class="stat-lbl">Pending</div></div>
+    </div>
+    <div id="adm-va-warn" style="display:none;background:#fff3e0;border-left:3px solid #ff8f00;border-radius:9px;padding:10px 12px;font-size:12px;color:#e65100;margin-bottom:11px"></div>
+    <div class="adm-tabs">
+      <button class="adm-tab-btn active" onclick="showAdmTab('pending',this)">⏳ Pending</button>
+      <button class="adm-tab-btn" onclick="showAdmTab('peserta',this)">👥 Peserta</button>
+      <button class="adm-tab-btn" onclick="showAdmTab('rekap',this)">📊 Rekap</button>
+      <button class="adm-tab-btn" onclick="showAdmTab('setting',this)">⚙️ Setting</button>
+    </div>
+    <div id="adm-tab-pending">
+      <div class="alert" id="alert-adm-panel"></div>
+      <div id="adm-pending-list"></div>
+    </div>
+    <div id="adm-tab-peserta" style="display:none">
+      <div id="adm-list-view">
+        <div class="filter-chips">
+          <button class="filter-btn active" data-filter="all"      onclick="setFilter('all')">Semua</button>
+          <button class="filter-btn" data-filter="va-belum"        onclick="setFilter('va-belum')">⚠️ Belum VA</button>
+          <button class="filter-btn" data-filter="va-ok"           onclick="setFilter('va-ok')">✅ Ada VA</button>
+          <button class="filter-btn" data-filter="aktif"           onclick="setFilter('aktif')">Sudah Setor</button>
+          <button class="filter-btn" data-filter="belum"           onclick="setFilter('belum')">Belum Setor</button>
+        </div>
+        <div class="sort-row">
+          <span>Urutkan:</span>
+          <select onchange="setSort(this.value)">
+            <option value="nama">Nama A–Z</option>
+            <option value="saldo-desc">Saldo Tertinggi</option>
+            <option value="saldo-asc">Saldo Terendah</option>
+            <option value="pct-desc">Progress Tertinggi</option>
+            <option value="terbaru">Daftar Terbaru</option>
+          </select>
+        </div>
+        <div id="adm-peserta-list"></div>
+      </div>
+      <div id="adm-detail" style="display:none">
+        <div class="detail-back" onclick="backToList()">← Kembali</div>
+        <div id="detail-content"></div>
+      </div>
+    </div>
+    <div id="adm-tab-rekap" style="display:none">
+      <div id="rekap-content">
+        <div class="empty-state"><div class="ei">⏳</div><p>Memuat rekap...</p></div>
+      </div>
+    </div>
+    <div id="adm-tab-setting" style="display:none">
+      <div class="card" style="border:2px solid #4caf50">
+        <div class="card-title">🐑 Pengaturan Paket Tabungan</div>
+        <p style="font-size:12px;color:#666;margin-bottom:12px">Atur nama dan harga paket yang tampil di form pendaftaran.</p>
+        <div class="alert" id="alert-paket-setting"></div>
+        <div id="paket-setting-list"></div>
+        <button class="btn btn-primary" onclick="simpanPaketSetting()" style="margin-top:8px">💾 Simpan Paket</button>
+      </div>
+      <div class="card" style="border:2px solid #2196f3">
+        <div class="card-title">📞 Edit Kontak Admin</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Nama & nomor HP admin yang tampil di halaman utama dan form pendaftaran.</p>
+        <div class="alert" id="alert-kontak-editor"></div>
+        <div id="kontak-editor-list"></div>
+        <button class="btn btn-primary" onclick="simpanKontak()" style="margin-top:8px">💾 Simpan Kontak</button>
+      </div>
+      <div class="card" style="border:2px solid var(--emas)">
+        <div class="card-title">💡 Edit Info Estimasi Harga</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Teks ini tampil di form pendaftaran sebagai panduan peserta.</p>
+        <div class="form-group"><label class="form-label">Teks Estimasi Harga</label>
+          <textarea class="form-input" id="adm-estimasi" rows="4" style="resize:vertical;font-size:13px;line-height:1.6"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="simpanEstimasi()" style="margin-bottom:10px">💾 Simpan Info Harga</button>
+      </div>
+      <div class="card" style="border:2px solid var(--hijau)">
+        <div class="card-title">📜 Edit Syarat &amp; Ketentuan</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Setiap poin = satu baris. Gunakan Enter untuk poin baru. Poin 8A–8D tulis di bawah poin 8 dengan awalan "A.", "B.", dst.</p>
+        <div class="alert" id="alert-sk-editor"></div>
+        <div class="form-group"><label class="form-label">Isi Syarat &amp; Ketentuan</label>
+          <textarea class="form-input" id="adm-sk" rows="16" style="resize:vertical;font-size:12px;line-height:1.8"></textarea>
+        </div>
+        <button class="btn btn-primary" onclick="simpanSK()">💾 Simpan S&amp;K</button>
+      </div>
+      <div class="card">
+        <div class="card-title">📤 Export Data</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Download data ke Excel / Google Sheets</p>
+        <button class="btn btn-primary" onclick="exportSemuaPeserta()" style="margin-bottom:8px">👥 Export Semua Peserta + Saldo (CSV)</button>
+        <p style="font-size:11px;color:#888;margin-bottom:12px">Nama · No HP · VA BSI · Alamat · Paket · Target · Total Setoran · Progress %</p>
+        <button class="btn btn-gold" onclick="exportCSV()">📋 Export Rekap Setoran Detail (CSV)</button>
+        <p style="font-size:11px;color:#888;margin-top:6px">Semua setoran dikonfirmasi + tanggal & catatan rekonsiliasi</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert</span></div>
+
+<!-- MODAL SYARAT & KETENTUAN -->
+<div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title">📜 Syarat &amp; Ketentuan</div>
+      <div class="modal-subtitle">Tabung Qurban Bersama Ar Ra'i Farm</div>
+      <button class="modal-close" onclick="tutupModalSK()">✕</button>
+    </div>
+    <div class="modal-body">
+      <ol class="sk-list">
+        <li>Program Tabung Qurban diperuntukkan bagi peserta yang berencana memilih dan membeli hewan qurban melalui Ar Ra'i Farm untuk Idul Adha 1448 H, yang diperkirakan berlangsung pada Mei 2027.</li>
+        <li>Peserta dapat memilih paket dan nominal setoran tabungan sesuai pilihan yang tersedia.</li>
+        <li>Tim Ar Ra'i Farm akan memberikan pengingat secara berkala sesuai jadwal menabung peserta.</li>
+        <li>Hewan qurban dapat disalurkan sendiri oleh peserta atau diamanahkan kepada Ar Ra'i Farm untuk disalurkan ke wilayah minim pequrban, daerah tertinggal, daerah terdampak bencana, atau wilayah yang mengalami keterbatasan distribusi daging qurban.</li>
+        <li>Harga hewan qurban sudah termasuk biaya distribusi untuk wilayah Surabaya, Sidoarjo, Gresik, dan Mojokerto. Penyaluran di luar wilayah tersebut dapat dikenakan biaya tambahan.</li>
+        <li>Peserta dapat mengubah paket atau nominal setoran tabungan paling lambat H-30 Idul Adha dengan melakukan konfirmasi kepada admin.</li>
+        <li>Saldo tabungan tidak dapat ditarik selama periode menabung.</li>
+        <li>Apabila sampai H-7 Idul Adha saldo belum mencapai target, peserta dapat memilih salah satu opsi berikut:
+          <ol type="A" class="sk-sub">
+            <li>Menambah kekurangan saldo agar dapat membeli hewan qurban sesuai pilihan;</li>
+            <li>Memilih hewan atau program sedekah daging sesuai saldo yang tersedia;</li>
+            <li>Melanjutkan saldo tabungan untuk program qurban tahun berikutnya; atau</li>
+            <li>Mengajukan pengembalian saldo tabungan.</li>
+          </ol>
+        </li>
+        <li>Setoran dilakukan melalui Virtual Account Bank Syariah Indonesia atas nama atau nomor identitas masing-masing peserta. Peserta dapat memantau saldo tabungan secara berkala.</li>
+        <li>Ar Ra'i Farm tidak mengenakan biaya administrasi selama masa menabung. Biaya transaksi yang dikenakan oleh bank atau penyedia layanan pembayaran, apabila ada, menjadi tanggungan peserta.</li>
+        <li>Jenis dan harga hewan qurban mengikuti daftar hewan serta harga yang ditetapkan Ar Ra'i Farm pada periode Idul Adha 1448 H. Apabila terdapat selisih antara saldo tabungan dan harga hewan yang dipilih, peserta wajib melunasi kekurangannya sebelum batas waktu yang ditentukan.</li>
+        <li>Ar Ra'i Farm dapat melakukan penyesuaian terhadap syarat dan ketentuan program apabila diperlukan, sepanjang tidak mengurangi saldo dan hak peserta yang telah terbentuk. Setiap perubahan akan diinformasikan melalui media komunikasi resmi Ar Ra'i Farm.</li>
+        <li>Apabila terjadi perbedaan pendapat atau perselisihan dalam pelaksanaan program, para pihak sepakat menyelesaikannya terlebih dahulu secara musyawarah untuk mufakat.</li>
+      </ol>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="setujuSK()">✅ Saya Setuju</button>
+      <button class="btn btn-outline" onclick="tutupModalSK()">Tutup</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
