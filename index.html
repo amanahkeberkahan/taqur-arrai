@@ -82,9 +82,29 @@ const normHP = hp => hp.replace(/\D/g,'').replace(/^0/,'62');
 const esc = value => String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','\"':'&quot;'}[ch]));
 const maskName = nama => {
   const parts = String(nama||'Peserta').trim().split(/\s+/).filter(Boolean);
-  if (parts.length <= 1) return parts[0] || 'Peserta';
-  return parts[0] + ' ' + parts.slice(1).map(x => x.charAt(0).toUpperCase()+'.').join(' ');
+  if (!parts.length) return 'Peserta';
+  const first = parts[0].replace(/[^A-Za-zÀ-ÿ]/g,'') || parts[0];
+  const maskedFirst = first.length <= 1 ? first.charAt(0).toUpperCase()+'***' : first.slice(0,2)+'***';
+  const initials = parts.slice(1).map(x => {
+    const clean = x.replace(/[^A-Za-zÀ-ÿ]/g,'');
+    return (clean.charAt(0) || x.charAt(0) || '').toUpperCase()+'.';
+  }).filter(Boolean).join(' ');
+  return initials ? maskedFirst+' '+initials : maskedFirst;
 };
+const participantWaMessage = p => `Assalamu'alaikum Bapak/Ibu ${p.nama}, saya Admin TaQur Ar-Ra'i Farm. Kami menghubungi terkait akun Tabungan Qurban Anda. Mohon konfirmasi apabila pesan ini sudah diterima. Jazakumullahu khairan.`;
+const participantWaUrl = p => `https://wa.me/${normHP(String(p.hp||''))}?text=${encodeURIComponent(participantWaMessage(p))}`;
+let lastRegisteredParticipant = null;
+const adminContactMessage = adminName => {
+  const p = currentParticipant || lastRegisteredParticipant;
+  if (currentParticipant && p) {
+    return `*[PESERTA TAQUR]*\nAssalamu'alaikum Admin ${adminName}. Saya ${p.nama}, peserta TaQur Ar-Ra'i Farm.\nNo. HP terdaftar: +${normHP(String(p.hp||''))}\n\nSaya ingin menyampaikan/menanyakan terkait:\n`;
+  }
+  if (lastRegisteredParticipant && p) {
+    return `*[PESERTA BARU TAQUR]*\nAssalamu'alaikum Admin ${adminName}. Saya ${p.nama}, baru mendaftar melalui aplikasi TaQur Ar-Ra'i Farm.\nNo. HP terdaftar: +${normHP(String(p.hp||''))}\n\nSaya ingin menyampaikan/menanyakan terkait:\n`;
+  }
+  return `*[PENGUNJUNG TAQUR]*\nAssalamu'alaikum Admin ${adminName}. Saya menghubungi melalui aplikasi TaQur Ar-Ra'i Farm.\nNama: \nStatus: calon peserta / belum login\n\nSaya ingin menanyakan terkait:\n`;
+};
+const adminWaUrl = k => `https://wa.me/${normHP(String(k.hp||''))}?text=${encodeURIComponent(adminContactMessage(k.nama||'TaQur'))}`;
 const pinValid = pin => /^\d{6}$/.test(pin) && !['000000','111111','123456','654321'].includes(pin);
 const randomSuffix = () => Math.random().toString(36).slice(2,8) + Date.now().toString(36).slice(-4);
 const participantAliasEmail = hp => `p.${hp}.${randomSuffix()}@login.taqur.id`;
@@ -216,12 +236,13 @@ async function loadDashboard() {
     document.getElementById('dash-target-label').textContent = 'Target kolektif: '+rp(totalTarget);
     document.getElementById('dash-target-sub').textContent = `${peserta} peserta · data publik terakhir disinkronkan admin`;
 
-    const items = topSnap.exists() && Array.isArray(topSnap.data().items) ? topSnap.data().items : [];
+    const items = (topSnap.exists() && Array.isArray(topSnap.data().items) ? topSnap.data().items : [])
+      .filter(p => Number(p.saldo||0) > 0);
     const top5El = document.getElementById('dash-top5');
     const seeBtn = document.getElementById('see-all-btn');
     seeBtn.style.display='none';
     if (!items.length) {
-      top5El.innerHTML='<div class="empty-state"><div class="ei">🐑</div><p>Belum ada data leaderboard publik.</p></div>';
+      top5El.innerHTML='<div class="empty-state"><div class="ei">🌱</div><p>Belum ada setoran terkonfirmasi.<br><small>Progress akan tampil setelah admin mengonfirmasi setoran.</small></p></div>';
       return;
     }
     const rankClass=['rank-1','rank-2','rank-3','rank-n','rank-n'];
@@ -446,6 +467,7 @@ function fillParticipantFields() {
   document.querySelectorAll('.participant-session-name').forEach(el=>el.textContent='Masuk sebagai '+currentParticipant.nama);
   setParticipantLoginVisibility(true);
   updateRecoveryButtons();
+  renderKontakDynamic().catch(console.warn);
   if (typeof renderSetorParticipant === 'function') renderSetorParticipant(currentParticipant);
 }
 
@@ -461,6 +483,8 @@ window.pesertaLogout = async function() {
   document.getElementById('setor-info').style.display='none';
   const notify=document.getElementById('setor-notify'); if(notify){notify.innerHTML='';notify.style.display='none';}
   selPeserta=null;
+  lastRegisteredParticipant=null;
+  renderKontakDynamic().catch(console.warn);
   showPage('dashboard');
 };
 
@@ -611,6 +635,8 @@ window.daftarPeserta = async function() {
       actorUid:uid,actorName:nama,actorRole:'participant',details:{jenis,targetNominal:target},timestamp:serverTimestamp()
     });
     await signOut(helperAuth);
+    lastRegisteredParticipant={nama,hp};
+    await renderKontakDynamic().catch(console.warn);
     ['daftar-nama','daftar-hp','daftar-alamat','daftar-pin','daftar-pin2'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('daftar-jenis').value='';
     document.getElementById('daftar-target').value='';
@@ -892,7 +918,8 @@ function renderPesertaList() {
     const vaBadge=p.nomorVA?`<span class="badge badge-green">🏦 ${esc(p.nomorVA)}</span>`:'<span class="badge badge-red">⚠️ Belum VA</span>';
     const authBadge=p.authUid?'<span class="badge badge-green">🔐 PIN aktif</span>':'<span class="badge badge-yellow">🔓 Belum PIN</span>';
     return `<div class="peserta-card" onclick="showDetail('${p.id}')"><div class="pc-top"><div class="avatar">${esc(p.nama.charAt(0).toUpperCase())}</div>
-      <div style="flex:1;min-width:0"><div class="p-nama">${esc(p.nama)} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div><div class="p-sub">📞 ${esc(p.hp)}</div>
+      <div style="flex:1;min-width:0"><div class="p-nama">${esc(p.nama)} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div>
+      <a class="participant-wa-link" href="${participantWaUrl(p)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Chat peserta melalui WhatsApp">📱 ${esc(p.hp)} · Chat WA</a>
       <div class="p-sub">🎯 Target: ${rp(targetP)}</div><div style="margin-top:3px">${vaBadge} ${authBadge}</div></div>
       <div style="text-align:right;flex-shrink:0"><div class="p-saldo">${rp(saldo)}</div><div class="p-pct">${pc2}%</div></div></div>
       <div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa"><span>${jml}x setor</span><span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span></div>
@@ -921,7 +948,9 @@ function renderDetail() {
   const confirmed=setoranP.filter(x=>x.status==='confirmed'),pending=setoranP.filter(x=>x.status==='pending');
   const saldo=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0),targetP=p.targetNominal||3500000,pc=pct(saldo,targetP);
   document.getElementById('detail-content').innerHTML=`
-    <div class="saldo-card" style="margin-bottom:12px"><div class="s-nama">${esc(p.nama)}</div><div class="s-hp">📞 ${esc(p.hp)}</div><div class="s-jenis">${esc(p.jenis)}</div>
+    <div class="saldo-card" style="margin-bottom:12px"><div class="s-nama">${esc(p.nama)}</div>
+      <a class="participant-wa-detail" href="${participantWaUrl(p)}" target="_blank" rel="noopener" title="Chat peserta melalui WhatsApp">📱 ${esc(p.hp)} · Buka WhatsApp</a>
+      <div class="s-jenis">${esc(p.jenis)}</div>
       <span class="s-angka">${rp(saldo)}</span><div class="s-label">Saldo Dikonfirmasi · ${confirmed.length}x setor</div><div class="s-progress"><div class="s-pfill" style="width:${pc}%"></div></div><div class="s-pct">${pc}%</div><div class="s-target">dari target pribadi ${rp(targetP)}</div></div>
     <div class="card" style="border:2px solid ${p.authUid?'#4caf50':'#ff9800'}"><div class="card-title">🔐 Akses Aman Peserta</div>
       <div style="font-size:12px;margin-bottom:10px;color:${p.authUid?'#2e7d32':'#e65100'}">${p.authUid?'✅ Akun PIN aktif. Tombol di bawah akan mereset PIN dan menonaktifkan akun lama.':'⚠️ Peserta lama belum memiliki akun Firebase Authentication.'}</div>
@@ -1017,7 +1046,15 @@ async function syncPublicStats(logAction=true){
   const confirmed=allSetoran.filter(x=>x.status==='confirmed');
   const totalDana=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0);
   const totalTarget=allPeserta.reduce((a,p)=>a+Number(p.targetNominal||0),0);
-  const items=allPeserta.map(p=>{const saldo=confirmed.filter(x=>x.pesertaId===p.id).reduce((a,x)=>a+Number(x.nominal||0),0);return{namaMasked:maskName(p.nama),jenis:p.jenis||'',saldo,target:p.targetNominal||0,progress:pct(saldo,p.targetNominal||3500000)};}).sort((a,b)=>b.saldo-a.saldo).slice(0,5);
+  const items=allPeserta.map(p=>{
+    const rows=confirmed.filter(x=>x.pesertaId===p.id);
+    const saldo=rows.reduce((a,x)=>a+Number(x.nominal||0),0);
+    const firstSetorMs=rows.length?Math.min(...rows.map(x=>x.tglInput?.toMillis?.() || Number(x.tglInput?.seconds||0)*1000 || Number.MAX_SAFE_INTEGER)):Number.MAX_SAFE_INTEGER;
+    return{namaMasked:maskName(p.nama),jenis:p.jenis||'',saldo,target:p.targetNominal||0,progress:pct(saldo,p.targetNominal||3500000),firstSetorMs};
+  }).filter(x=>x.saldo>0)
+    .sort((a,b)=>b.saldo-a.saldo || b.progress-a.progress || a.firstSetorMs-b.firstSetorMs)
+    .slice(0,5)
+    .map(({firstSetorMs,...item})=>item);
   const batch=writeBatch(db);
   batch.set(doc(db,'public_stats','overview'),{totalPeserta:allPeserta.length,totalDana,totalTarget,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
   batch.set(doc(db,'leaderboard_public','top5'),{items,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
@@ -1075,7 +1112,7 @@ async function renderKontakDynamic() {
         <div style="font-size:20px">📱</div>
         <div>
           <div class="kontak-nama">${k.nama}</div>
-          <a href="https://wa.me/${k.hp}" target="_blank" class="kontak-no kontak-no-link">+${k.hp.replace(/^62/,'62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>
+          <a href="${adminWaUrl(k)}" target="_blank" rel="noopener" class="kontak-no kontak-no-link" title="Chat Admin TaQur dengan pesan pembuka">+${k.hp.replace(/^62/,'62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>
         </div>
       </div>
     `).join('');
@@ -1085,7 +1122,7 @@ async function renderKontakDynamic() {
   const suksesCont = document.getElementById('kontak-sukses-dynamic');
   if (suksesCont) {
     suksesCont.innerHTML = list.map(k =>
-      `<a href="https://wa.me/${k.hp}" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 ${k.nama}: +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>`
+      `<a href="${adminWaUrl(k)}" target="_blank" rel="noopener" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 ${esc(k.nama)}: +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</a>`
     ).join('');
   }
 
@@ -1093,7 +1130,7 @@ async function renderKontakDynamic() {
   const setorCont = document.getElementById('kontak-setor-dynamic');
   if (setorCont) {
     setorCont.innerHTML = list.map(k =>
-      `<strong>${k.nama} +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</strong>`
+      `<a href="${adminWaUrl(k)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px"><strong>${esc(k.nama)} +${k.hp.replace(/^62/,'+62 ').replace(/(\d{3})(\d{4})(\d+)/,'$1-$2-$3')}</strong></a>`
     ).join(' atau ');
   }
 }
@@ -1619,6 +1656,10 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .pc-top{display:flex;align-items:flex-start;gap:10px;}
 .p-nama{font-weight:700;font-size:13px;color:var(--hijau);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .p-sub{font-size:11px;color:#888;margin-top:1px;}
+.participant-wa-link{display:inline-flex;align-items:center;gap:4px;margin-top:3px;font-size:11px;font-weight:700;color:#128c4a;text-decoration:none;border-bottom:1px dashed rgba(18,140,74,.45);padding-bottom:1px;}
+.participant-wa-link:hover{color:#075e35;border-bottom-style:solid;}
+.participant-wa-detail{display:inline-block;margin:4px 0 2px;color:#f5e6a3;font-size:12px;font-weight:700;text-decoration:none;border:1px solid rgba(245,230,163,.45);border-radius:999px;padding:6px 12px;}
+.participant-wa-detail:hover{background:rgba(245,230,163,.12);}
 .p-saldo{font-family:'Amiri',serif;font-size:13px;font-weight:700;color:var(--hijau-mid);}
 .p-pct{font-size:10px;color:var(--emas);}
 .kontak-box{background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:14px;padding:16px;margin-bottom:11px;}
@@ -1710,7 +1751,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     </div>
   </div>
   <div class="card">
-    <div class="card-title">🏆 Top 5 Penabung</div>
+    <div class="card-title">🌱 Progress Tabungan Teratas</div>
     <div id="dash-top5"><div class="empty-state"><div class="ei">⏳</div><p>Memuat data...</p></div></div>
     <div class="see-all" id="see-all-btn" style="display:none" onclick="showPage('admin')">Lihat semua peserta di Admin →</div>
   </div>
@@ -1721,14 +1762,14 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
         <div style="font-size:20px">📱</div>
         <div>
           <div class="kontak-nama">Aynur</div>
-          <a href="https://wa.me/6282139691445" target="_blank" class="kontak-no kontak-no-link">+62 821-3969-1445</a>
+          <a href="https://wa.me/6282139691445?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Aynur.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" class="kontak-no kontak-no-link">+62 821-3969-1445</a>
         </div>
       </div>
       <div class="kontak-item">
         <div style="font-size:20px">📱</div>
         <div>
           <div class="kontak-nama">Chandra</div>
-          <a href="https://wa.me/6285733844255" target="_blank" class="kontak-no kontak-no-link">+62 857-3384-4255</a>
+          <a href="https://wa.me/6285733844255?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Chandra.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" class="kontak-no kontak-no-link">+62 857-3384-4255</a>
         </div>
       </div>
     </div>
@@ -1831,7 +1872,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="si">🎉</div>
     <h3>Pendaftaran Berhasil!</h3>
     <p>Selamat bergabung dalam program TaQur Ar-Ra'i Farm.<br>Semoga Allah meridhoi niat qurban Anda.</p>
-    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Gunakan <strong>No. HP + PIN</strong> sekali per sesi untuk membuka saldo, VA, dan melaporkan setoran. Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong>.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
+    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Gunakan <strong>No. HP + PIN</strong> sekali per sesi untuk membuka saldo, VA, dan melaporkan setoran. Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong>.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Aynur.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Chandra.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
   </div>
   <div class="ayat-box" style="margin-top:12px">
     <div class="ayat-text">"Tidak ada amalan anak Adam pada hari Nahr yang lebih dicintai Allah selain menyembelih hewan qurban."</div>
@@ -2003,7 +2044,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
   </div>
 </div>
 
-<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v5</span></div>
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v7</span></div>
 
 <!-- MODAL SYARAT & KETENTUAN -->
 <div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
