@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
+<meta name="taqur-build" content="security-v4-google-recovery">
 <meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
 <meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
 <meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
@@ -32,8 +33,8 @@ import {
   getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
   createUserWithEmailAndPassword, setPersistence, browserLocalPersistence,
   browserSessionPersistence, inMemoryPersistence, sendPasswordResetEmail, updatePassword,
-  EmailAuthProvider, reauthenticateWithCredential, GoogleAuthProvider,
-  linkWithPopup, signInWithPopup, deleteUser
+  EmailAuthProvider, reauthenticateWithCredential, GoogleAuthProvider, linkWithPopup,
+  signInWithPopup, deleteUser
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 // ▼▼▼ PASTE CONFIG DI SINI ▼▼▼
@@ -72,9 +73,6 @@ const helperDb = getFirestore(helperApp);
 const helperAuth = getAuth(helperApp);
 setPersistence(helperAuth, inMemoryPersistence).catch(console.warn);
 
-const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
-
 // ============================================================
 // UTILS
 // ============================================================
@@ -90,11 +88,6 @@ const maskName = nama => {
 const pinValid = pin => /^\d{6}$/.test(pin) && !['000000','111111','123456','654321'].includes(pin);
 const randomSuffix = () => Math.random().toString(36).slice(2,8) + Date.now().toString(36).slice(-4);
 const participantAliasEmail = hp => `p.${hp}.${randomSuffix()}@login.taqur.id`;
-const temporaryAdminPassword = () => {
-  const bytes = new Uint32Array(4);
-  crypto.getRandomValues(bytes);
-  return `Tq!${Array.from(bytes).map(n=>n.toString(36)).join('').slice(0,18)}9a`;
-};
 const authMessage = err => {
   const code = err?.code || '';
   if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) return 'No. HP atau PIN/password salah.';
@@ -102,11 +95,9 @@ const authMessage = err => {
   if (code.includes('email-already-in-use')) return 'Akun sudah tersedia. Gunakan login atau minta reset PIN ke admin.';
   if (code.includes('weak-password')) return 'PIN/password belum memenuhi ketentuan keamanan.';
   if (code.includes('network-request-failed')) return 'Koneksi internet bermasalah.';
-  if (code.includes('popup-closed-by-user')) return 'Proses Google dibatalkan.';
-  if (code.includes('popup-blocked')) return 'Pop-up Google diblokir browser. Izinkan pop-up lalu coba lagi.';
-  if (code.includes('credential-already-in-use')) return 'Akun Google ini sudah terhubung ke akun TaQur lain.';
-  if (code.includes('provider-already-linked')) return 'Pemulihan Google sudah aktif.';
-  if (code.includes('account-exists-with-different-credential')) return 'Email Google ini sudah digunakan oleh metode login lain.';
+  if (code.includes('popup-closed-by-user')) return 'Proses Google dibatalkan sebelum selesai.';
+  if (code.includes('popup-blocked')) return 'Popup Google diblokir browser. Izinkan popup lalu coba lagi.';
+  if (code.includes('credential-already-in-use') || code.includes('account-exists-with-different-credential')) return 'Akun Google tersebut sudah digunakan pada akun TaQur lain. Gunakan akun Google berbeda atau hubungi admin.';
   return err?.message || 'Terjadi kesalahan.';
 };
 const tglFmt = ts => {
@@ -395,12 +386,7 @@ async function getCurrentParticipant() {
   if (u.role!=='participant' || u.active!==true || !u.participantId) return null;
   const pSnap = await getDoc(doc(db,'peserta',u.participantId));
   if (!pSnap.exists() || pSnap.data().deleted) return null;
-  return {
-    id:pSnap.id,...pSnap.data(),uid:user.uid,
-    loginEmail:u.loginEmail||'',
-    recoveryProvider:u.recoveryProvider||'',
-    recoveryEmail:u.recoveryEmail||''
-  };
+  return {id:pSnap.id,...pSnap.data(),uid:user.uid};
 }
 
 async function signInParticipant(hp, pin, alertId) {
@@ -454,26 +440,12 @@ function startParticipantIdleTimer(){
 }
 ['click','touchstart','keydown'].forEach(evt=>document.addEventListener(evt,()=>{if(currentParticipant)startParticipantIdleTimer();},{passive:true}));
 
-function googleRecoveryLinked() {
-  return !!auth.currentUser?.providerData?.some(p=>p.providerId==='google.com');
-}
-
-function updateParticipantRecoveryUI() {
-  const linked = googleRecoveryLinked();
-  document.querySelectorAll('.participant-recovery-btn').forEach(btn=>{
-    btn.textContent = linked ? '✅ Google Aktif' : '🔑 Aktifkan Google';
-    btn.title = linked
-      ? 'Akun Google sudah terhubung untuk pemulihan PIN'
-      : 'Hubungkan akun Google agar PIN bisa dipulihkan tanpa admin';
-  });
-}
-
 function fillParticipantFields() {
   if (!currentParticipant) { setParticipantLoginVisibility(false); return; }
   ['va-hp','setor-hp','cek-hp'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=currentParticipant.hp; });
   document.querySelectorAll('.participant-session-name').forEach(el=>el.textContent='Masuk sebagai '+currentParticipant.nama);
   setParticipantLoginVisibility(true);
-  updateParticipantRecoveryUI();
+  updateRecoveryButtons();
   if (typeof renderSetorParticipant === 'function') renderSetorParticipant(currentParticipant);
 }
 
@@ -481,6 +453,7 @@ window.pesertaLogout = async function() {
   clearTimeout(participantIdleTimer);
   await signOut(auth).catch(()=>{});
   currentParticipant=null;
+  updateRecoveryButtons();
   ['va-hp','va-pin','setor-hp','setor-pin','cek-hp','cek-pin'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
   setParticipantLoginVisibility(false);
   document.getElementById('saldo-result').style.display='none';
@@ -499,110 +472,99 @@ window.ubahPinSaya = async function() {
   if (baru===null) return;
   if (!pinValid(baru)) return alert('PIN baru harus 6 digit dan tidak boleh terlalu mudah.');
   try {
-    const loginEmail = currentParticipant.loginEmail || auth.currentUser.email;
-    const credential = EmailAuthProvider.credential(loginEmail,lama);
+    const credential = EmailAuthProvider.credential(auth.currentUser.email,lama);
     await reauthenticateWithCredential(auth.currentUser,credential);
     await updatePassword(auth.currentUser,baru);
-    await writeAudit('PARTICIPANT_CHANGE_PIN','peserta',currentParticipant.id,{method:'old-pin'});
+    await writeAudit('PARTICIPANT_CHANGE_PIN','peserta',currentParticipant.id,{});
     alert('✅ PIN berhasil diubah.');
   } catch(e) { alert('Gagal mengubah PIN: '+authMessage(e)); }
 };
 
-window.aktifkanPemulihanGoogle = async function() {
-  if (!auth.currentUser || !currentParticipant) return alert('Silakan login sebagai peserta terlebih dahulu.');
-  if (googleRecoveryLinked()) {
-    const googleData = auth.currentUser.providerData.find(p=>p.providerId==='google.com');
-    return alert(`✅ Pemulihan Google sudah aktif${googleData?.email ? ` untuk ${googleData.email}` : ''}.`);
-  }
-  try {
-    const result = await linkWithPopup(auth.currentUser, googleProvider);
-    const googleData = result.user.providerData.find(p=>p.providerId==='google.com');
-    await updateDoc(doc(db,'users',result.user.uid),{
-      recoveryProvider:'google.com',
-      recoveryEmail:googleData?.email||'',
-      recoveryLinkedAt:serverTimestamp()
-    });
-    currentParticipant = await getCurrentParticipant();
-    updateParticipantRecoveryUI();
-    await writeAudit('PARTICIPANT_LINK_GOOGLE','peserta',currentParticipant.id,{
-      recoveryEmail:googleData?.email||''
-    });
-    alert('✅ Pemulihan Google aktif. Jika lupa PIN, pilih “Pulihkan dengan Google”.');
-  } catch(e) {
-    alert('Gagal mengaktifkan pemulihan Google: '+authMessage(e));
-  }
-};
 
-let pinRecoveryMode = false;
-
-function bukaModalPinBaru() {
-  pinRecoveryMode = true;
-  const modal = document.getElementById('modal-reset-pin');
-  document.getElementById('recovery-pin-new').value='';
-  document.getElementById('recovery-pin-confirm').value='';
-  document.getElementById('alert-recovery-pin').className='alert';
-  modal.classList.add('open');
-  document.body.style.overflow='hidden';
+function updateRecoveryButtons() {
+  const linked = !!auth.currentUser?.providerData?.some(p => p.providerId === 'google.com');
+  document.querySelectorAll('.recovery-link-btn').forEach(btn => {
+    btn.textContent = linked ? '✅ Google Terhubung' : '🛡️ Aktifkan Google';
+    btn.disabled = linked;
+    btn.style.opacity = linked ? '.65' : '1';
+  });
 }
 
-window.tutupModalPinBaru = function(e) {
-  if (e && e.target !== document.getElementById('modal-reset-pin')) return;
-  document.getElementById('modal-reset-pin').classList.remove('open');
-  document.body.style.overflow='';
-  pinRecoveryMode=false;
+window.aktifkanPemulihanGoogle = async function() {
+  if (!auth.currentUser || !currentParticipant) return alert('Silakan login sebagai peserta terlebih dahulu.');
+  if (auth.currentUser.providerData.some(p => p.providerId === 'google.com')) {
+    updateRecoveryButtons();
+    return alert('Akun Google sudah terhubung sebagai pemulihan PIN.');
+  }
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({prompt:'select_account'});
+    const result = await linkWithPopup(auth.currentUser, provider);
+    const googleInfo = result.user.providerData.find(p => p.providerId === 'google.com');
+    await updateDoc(doc(db,'users',result.user.uid), {
+      recoveryProvider:'google.com',
+      recoveryEmail:googleInfo?.email || '',
+      recoveryLinkedAt:serverTimestamp()
+    });
+    await writeAudit('PARTICIPANT_LINK_GOOGLE','peserta',currentParticipant.id,{recoveryEmail:googleInfo?.email || ''});
+    updateRecoveryButtons();
+    alert('✅ Akun Google berhasil dihubungkan. Jika lupa PIN, gunakan tombol “Pulihkan dengan Google”.');
+  } catch(e) {
+    alert('Gagal menghubungkan Google: '+authMessage(e));
+  }
 };
 
-window.lupaPinPeserta = async function() {
+window.pulihkanPinDenganGoogle = async function(hpInputId, alertId) {
+  const hpEl = document.getElementById(hpInputId);
+  const hp = normHP(hpEl?.value.trim() || '');
+  if (!hp || hp.length < 10) return showAlert(alertId,'error','Masukkan No. HP yang terdaftar terlebih dahulu.');
   try {
-    if (auth.currentUser) await signOut(auth);
-    currentAdmin=null;
-    currentParticipant=null;
-    setParticipantLoginVisibility(false);
+    if (auth.currentUser) await signOut(auth).catch(()=>{});
+    currentParticipant = null;
+    currentAdmin = null;
     await setPersistence(auth,browserSessionPersistence);
-    const result = await signInWithPopup(auth,googleProvider);
-    const profileSnap = await getDoc(doc(db,'users',result.user.uid));
-    if (!profileSnap.exists()) {
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({prompt:'select_account'});
+    const result = await signInWithPopup(auth, provider);
+    const userSnap = await getDoc(doc(db,'users',result.user.uid));
+    const hasGoogle = result.user.providerData.some(p => p.providerId === 'google.com');
+
+    if (!userSnap.exists()) {
+      // Google yang belum pernah ditautkan dapat membuat akun Auth baru. Hapus lagi agar tidak menjadi akun yatim.
       await deleteUser(result.user).catch(()=>{});
-      throw new Error('Akun Google ini belum pernah dihubungkan ke peserta TaQur.');
-    }
-    const profile = profileSnap.data();
-    if (profile.role!=='participant' || profile.active!==true) {
       await signOut(auth).catch(()=>{});
-      throw new Error('Akun Google ini bukan akun pemulihan peserta.');
+      throw new Error('Akun Google ini belum pernah ditautkan ke peserta TaQur. Login dengan PIN terlebih dahulu lalu aktifkan pemulihan Google.');
     }
+
+    const u = userSnap.data();
+    if (u.role !== 'participant' || u.active !== true || !hasGoogle) {
+      await signOut(auth).catch(()=>{});
+      throw new Error('Akun Google ini bukan akun pemulihan peserta TaQur.');
+    }
+
     currentParticipant = await getCurrentParticipant();
-    if (!currentParticipant) {
+    if (!currentParticipant || currentParticipant.hp !== hp) {
       await signOut(auth).catch(()=>{});
-      throw new Error('Data peserta tidak ditemukan atau akun tidak aktif.');
+      currentParticipant = null;
+      throw new Error('Akun Google tidak cocok dengan nomor HP tersebut.');
     }
+
+    const baru = prompt('Masukkan PIN baru (6 digit, hindari 123456/angka berulang):');
+    if (baru === null) { await signOut(auth).catch(()=>{}); currentParticipant=null; return; }
+    const ulang = prompt('Ulangi PIN baru:');
+    if (ulang === null) { await signOut(auth).catch(()=>{}); currentParticipant=null; return; }
+    if (!pinValid(baru)) throw new Error('PIN baru harus 6 digit dan tidak boleh terlalu mudah.');
+    if (baru !== ulang) throw new Error('Konfirmasi PIN baru tidak sama.');
+
+    await updatePassword(result.user,baru);
     fillParticipantFields();
     startParticipantIdleTimer();
-    bukaModalPinBaru();
+    await writeAudit('PARTICIPANT_RECOVER_PIN_GOOGLE','peserta',currentParticipant.id,{});
+    showAlert(alertId,'success','✅ PIN berhasil diperbarui melalui akun Google. Anda sudah masuk.');
   } catch(e) {
-    await signOut(auth).catch(()=>{});
-    currentParticipant=null;
-    alert('Pemulihan gagal: '+authMessage(e));
+    if (!currentParticipant) await signOut(auth).catch(()=>{});
+    showAlert(alertId,'error',authMessage(e));
   }
-};
-
-window.simpanPinPemulihan = async function() {
-  if (!pinRecoveryMode || !auth.currentUser || !currentParticipant) return;
-  const pin=document.getElementById('recovery-pin-new').value.trim();
-  const pin2=document.getElementById('recovery-pin-confirm').value.trim();
-  if(!pinValid(pin)) return showAlert('alert-recovery-pin','error','PIN harus 6 digit dan tidak boleh terlalu mudah.');
-  if(pin!==pin2) return showAlert('alert-recovery-pin','error','Konfirmasi PIN tidak sama.');
-  setLoading('btn-save-recovery-pin',true);
-  try {
-    await updatePassword(auth.currentUser,pin);
-    await writeAudit('PARTICIPANT_RESET_PIN_GOOGLE','peserta',currentParticipant.id,{method:'google'});
-    document.getElementById('modal-reset-pin').classList.remove('open');
-    document.body.style.overflow='';
-    pinRecoveryMode=false;
-    alert('✅ PIN baru berhasil dibuat. Akun tetap sama dan seluruh data tetap terhubung.');
-  } catch(e) {
-    showAlert('alert-recovery-pin','error','Gagal membuat PIN baru: '+authMessage(e));
-  }
-  setLoading('btn-save-recovery-pin',false);
 };
 
 // ============================================================
@@ -1267,47 +1229,17 @@ window.showAdmTab=function(tab,btn){
 
 window.buatAdminBaru=async function(){
   if(currentAdmin?.role!=='superadmin')return;
-  const nama=document.getElementById('sec-admin-nama').value.trim();
-  const email=document.getElementById('sec-admin-email').value.trim().toLowerCase();
-  const role=document.getElementById('sec-admin-role').value;
-  if(!nama||!email)return showAlert('alert-security','error','Nama dan email admin wajib diisi.');
-  const tempPassword=temporaryAdminPassword();
-  try{
-    await signOut(helperAuth).catch(()=>{});
-    const cred=await createUserWithEmailAndPassword(helperAuth,email,tempPassword);
-    await setDoc(doc(db,'users',cred.user.uid),{
-      nama,email,role,active:true,invitationPending:true,
-      createdAt:serverTimestamp(),createdBy:currentAdmin.uid
-    });
-    let emailSent=true;
-    try{await sendPasswordResetEmail(helperAuth,email);}catch(mailError){emailSent=false;console.warn('Undangan email gagal:',mailError);}
-    await signOut(helperAuth);
-    await writeAudit('INVITE_ADMIN','user',cred.user.uid,{nama,email,role,emailSent});
-    ['sec-admin-nama','sec-admin-email'].forEach(id=>document.getElementById(id).value='');
-    showAlert('alert-security',emailSent?'success':'info',emailSent
-      ?'✅ Undangan dikirim. Admin membuat password sendiri melalui email.'
-      :'⚠️ Akun admin sudah dibuat, tetapi email belum terkirim. Gunakan tombol “Kirim Ulang Email”.');
-    await renderAdminUsers();
-  }catch(e){
-    await signOut(helperAuth).catch(()=>{});
-    showAlert('alert-security','error',authMessage(e));
-  }
-};
-
-window.kirimUlangUndanganAdmin=async function(email){
-  if(currentAdmin?.role!=='superadmin'||!email)return;
-  try{
-    await sendPasswordResetEmail(helperAuth,email);
-    await writeAudit('RESEND_ADMIN_INVITATION','user','',{email});
-    showAlert('alert-security','success','✅ Email pembuatan/reset password dikirim ulang.');
-  }catch(e){showAlert('alert-security','error',authMessage(e));}
+  const nama=document.getElementById('sec-admin-nama').value.trim(),email=document.getElementById('sec-admin-email').value.trim().toLowerCase(),pass=document.getElementById('sec-admin-pass').value,role=document.getElementById('sec-admin-role').value;
+  if(!nama||!email||pass.length<8)return showAlert('alert-security','error','Nama, email, dan password minimal 8 karakter wajib diisi.');
+  try{await signOut(helperAuth).catch(()=>{});const cred=await createUserWithEmailAndPassword(helperAuth,email,pass);await setDoc(doc(db,'users',cred.user.uid),{nama,email,role,active:true,createdAt:serverTimestamp(),createdBy:currentAdmin.uid});await signOut(helperAuth);await writeAudit('CREATE_ADMIN','user',cred.user.uid,{nama,email,role});['sec-admin-nama','sec-admin-email','sec-admin-pass'].forEach(id=>document.getElementById(id).value='');showAlert('alert-security','success','✅ Akun admin berhasil dibuat.');await renderAdminUsers();}
+  catch(e){await signOut(helperAuth).catch(()=>{});showAlert('alert-security','error',authMessage(e));}
 };
 
 async function renderAdminUsers(){
   if(currentAdmin?.role!=='superadmin')return;
   const snap=await getDocs(collection(db,'users'));const rows=snap.docs.map(d=>({uid:d.id,...d.data()})).filter(x=>['admin','superadmin'].includes(x.role));
   const el=document.getElementById('security-admin-list');
-  el.innerHTML=rows.length?rows.map(x=>`<div class="peserta-card"><div class="pc-top"><div class="avatar">${esc((x.nama||x.email||'?').charAt(0).toUpperCase())}</div><div style="flex:1"><div class="p-nama">${esc(x.nama||'-')}</div><div class="p-sub">${esc(x.email||'-')} · ${esc(x.role)}</div></div><span class="badge ${x.active?'badge-green':'badge-red'}">${x.active?'Aktif':'Nonaktif'}</span></div>${x.uid!==currentAdmin.uid?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button class="btn btn-outline btn-sm" onclick="toggleAdminActive('${x.uid}',${x.active?'false':'true'})">${x.active?'Nonaktifkan':'Aktifkan'}</button><button class="btn btn-outline btn-sm" onclick="kirimUlangUndanganAdmin('${esc(x.email||'')}')">Kirim Ulang Email</button></div>`:'<div style="font-size:10px;color:#888;margin-top:5px">Akun yang sedang digunakan</div>'}</div>`).join(''):'<div class="empty-state"><p>Belum ada admin.</p></div>';
+  el.innerHTML=rows.length?rows.map(x=>`<div class="peserta-card"><div class="pc-top"><div class="avatar">${esc((x.nama||x.email||'?').charAt(0).toUpperCase())}</div><div style="flex:1"><div class="p-nama">${esc(x.nama||'-')}</div><div class="p-sub">${esc(x.email||'-')} · ${esc(x.role)}</div></div><span class="badge ${x.active?'badge-green':'badge-red'}">${x.active?'Aktif':'Nonaktif'}</span></div>${x.uid!==currentAdmin.uid?`<button class="btn btn-outline btn-sm" onclick="toggleAdminActive('${x.uid}',${x.active?'false':'true'})" style="margin-top:8px">${x.active?'Nonaktifkan':'Aktifkan'}</button>`:'<div style="font-size:10px;color:#888;margin-top:5px">Akun yang sedang digunakan</div>'}</div>`).join(''):'<div class="empty-state"><p>Belum ada admin.</p></div>';
 }
 window.toggleAdminActive=async function(uid,active){if(currentAdmin?.role!=='superadmin'||uid===currentAdmin.uid)return;try{await updateDoc(doc(db,'users',uid),{active,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid});await writeAudit(active?'ENABLE_ADMIN':'DISABLE_ADMIN','user',uid,{});await renderAdminUsers();}catch(e){showAlert('alert-security','error',authMessage(e));}};
 
@@ -1728,9 +1660,6 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .sk-sub li{margin-bottom:4px;}
 .modal-footer{padding:14px 18px;border-top:1px solid var(--krem-dark);display:flex;gap:8px;}
 .modal-footer .btn{flex:1;}
-.participant-session-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;}
-.recovery-link{width:100%;margin-top:4px;background:transparent;border:0;color:var(--hijau-mid);font-family:'Tajawal',sans-serif;font-size:12px;font-weight:700;cursor:pointer;text-decoration:underline;}
-.recovery-note{background:#fff8e1;border:1px solid var(--emas-pale);border-radius:9px;padding:9px 10px;font-size:11px;color:#795548;line-height:1.5;margin-top:8px;}
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
 </style>
@@ -1912,20 +1841,21 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 
 <!-- NO VA -->
 <div id="page-va" class="page">
-  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div><button class="btn btn-outline btn-sm recovery-link-btn" onclick="aktifkanPemulihanGoogle()">🛡️ Aktifkan Google</button> <button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
   <div class="card participant-login-card"><div class="card-title">🔐 Masuk Peserta</div><div style="font-size:12px;color:#666;margin-bottom:10px">Masuk sekali untuk membuka VA, laporan setoran, saldo, dan riwayat selama sesi ini.</div>
     <div class="form-group"><label class="form-label">No. HP *</label><input type="tel" class="form-input" id="va-hp" placeholder="08xx-xxxx-xxxx"></div>
     <div class="form-group"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="va-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cekVA()"><button class="btn btn-primary" onclick="cekVA()">Masuk</button></div></div>
-    <button class="recovery-link" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button>
+    <button class="btn btn-outline btn-sm" onclick="pulihkanPinDenganGoogle('va-hp','alert-va')">Lupa PIN? Pulihkan dengan Google</button>
   </div><div class="alert" id="alert-va"></div><div id="va-result"></div>
 </div>
 
 <!-- SETOR -->
 <div id="page-setor" class="page">
-  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div><button class="btn btn-outline btn-sm recovery-link-btn" onclick="aktifkanPemulihanGoogle()">🛡️ Aktifkan Google</button> <button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
   <div class="card"><div class="card-title">💰 Input Setoran TaQur</div><div class="alert" id="alert-setor"></div>
     <div class="form-group participant-login-fields"><label class="form-label">No. HP Penabung *</label><input type="tel" class="form-input" id="setor-hp" placeholder="08xx-xxxx-xxxx"></div>
-    <div class="form-group participant-login-fields"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="setor-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cariPesertaSetor()"><button class="btn btn-outline" onclick="cariPesertaSetor()">Masuk</button></div></div><button class="recovery-link participant-login-fields" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button><div id="setor-info" style="display:none;margin:6px 0 10px"></div>
+    <div class="form-group participant-login-fields"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="setor-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cariPesertaSetor()"><button class="btn btn-outline" onclick="cariPesertaSetor()">Masuk</button></div></div>
+    <div class="participant-login-fields" style="margin:-4px 0 8px"><button class="btn btn-outline btn-sm" onclick="pulihkanPinDenganGoogle('setor-hp','alert-setor')">Lupa PIN? Pulihkan dengan Google</button></div><div id="setor-info" style="display:none;margin:6px 0 10px"></div>
     <div class="participant-protected-content" style="display:none">
       <div class="form-group"><label class="form-label">Jumlah Setoran (Rp) *</label><div style="position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:#888;font-weight:600;pointer-events:none">Rp</span><input type="text" inputmode="numeric" class="form-input" id="setor-nominal" placeholder="0" style="padding-left:34px;font-weight:700;font-size:15px;letter-spacing:.5px" oninput="formatNominalSetor(this)"></div><div id="setor-nominal-hint" style="font-size:11px;color:var(--hijau-mid);margin-top:4px;display:none"></div></div>
       <div class="form-group"><label class="form-label">Tanggal Setoran *</label><input type="date" class="form-input" id="setor-tgl"></div>
@@ -1937,12 +1867,11 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 
 <!-- CEK SALDO -->
 <div id="page-cek" class="page">
-  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm" onclick="ubahPinSaya()">Ubah PIN</button><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div><button class="btn btn-outline btn-sm recovery-link-btn" onclick="aktifkanPemulihanGoogle()">🛡️ Aktifkan Google</button> <button class="btn btn-outline btn-sm" onclick="ubahPinSaya()">Ubah PIN</button> <button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
   <div class="card participant-login-card"><div class="card-title">🔐 Masuk Peserta</div><div style="font-size:12px;color:#666;margin-bottom:10px">Masuk sekali untuk membuka saldo, VA, dan laporan setoran selama sesi ini.</div>
     <div class="form-group"><label class="form-label">No. HP *</label><input type="tel" class="form-input" id="cek-hp" placeholder="08xx-xxxx-xxxx"></div>
     <div class="form-group"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="cek-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cekSaldo()"><button class="btn btn-primary" onclick="cekSaldo()">Masuk & Cek</button></div></div>
-    <button class="recovery-link" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button>
-    <div class="recovery-note">Pemulihan mandiri hanya bisa digunakan setelah akun Google ditautkan saat masih bisa masuk.</div>
+    <button class="btn btn-outline btn-sm" onclick="pulihkanPinDenganGoogle('cek-hp','alert-cek')">Lupa PIN? Pulihkan dengan Google</button>
   </div><div class="alert" id="alert-cek"></div>
   <div class="saldo-result" id="saldo-result"><div class="saldo-card"><div class="s-nama" id="res-nama">—</div><div class="s-hp" id="res-hp">—</div><div class="s-jenis" id="res-jenis">—</div><span class="s-angka" id="res-saldo">Rp 0</span><div class="s-label">Total Saldo Dikonfirmasi</div><div class="s-progress"><div class="s-pfill" id="res-bar" style="width:0%"></div></div><div class="s-pct" id="res-pct">0%</div><div class="s-target" id="res-target"></div><div class="pending-notice" id="res-pending" style="display:none;margin-top:10px"></div></div><div class="card"><div class="card-title">📋 Riwayat Setoran</div><div id="res-history"></div></div></div>
 </div>
@@ -2060,9 +1989,9 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       <div class="card" style="border:2px solid var(--hijau)"><div class="card-title">👤 Tambah Admin</div>
         <div class="form-group"><label class="form-label">Nama</label><input class="form-input" id="sec-admin-nama" placeholder="Nama admin"></div>
         <div class="form-group"><label class="form-label">Email</label><input type="email" class="form-input" id="sec-admin-email" placeholder="admin@email.com"></div>
-        <div class="recovery-note" style="margin-bottom:10px">Superadmin tidak perlu membuat atau mengetahui password. Sistem membuat akun sementara lalu mengirim email agar admin menetapkan password sendiri.</div>
+        <div class="form-group"><label class="form-label">Password Awal</label><input type="password" class="form-input" id="sec-admin-pass" placeholder="Minimal 8 karakter"></div>
         <div class="form-group"><label class="form-label">Role</label><select class="form-input" id="sec-admin-role"><option value="admin">Admin</option><option value="superadmin">Super Admin</option></select></div>
-        <button class="btn btn-primary" onclick="buatAdminBaru()">✉️ Kirim Undangan Admin</button></div>
+        <button class="btn btn-primary" onclick="buatAdminBaru()">🔐 Buat Akun Admin</button></div>
       <div class="card"><div class="card-title">🛡️ Daftar Admin</div><div id="security-admin-list"></div></div>
       <div class="card"><div class="card-title">🔄 Sinkronisasi Data Publik</div><p style="font-size:12px;color:#666;margin-bottom:10px">Memperbarui statistik dan leaderboard publik tanpa membuka data pribadi peserta.</p><button class="btn btn-gold" onclick="syncPublicDashboard()">Sinkronkan Dashboard Publik</button></div>
     </div>
@@ -2073,28 +2002,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
   </div>
 </div>
 
-<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v3</span></div>
-
-<!-- MODAL RESET PIN VIA GOOGLE -->
-<div id="modal-reset-pin" class="modal-overlay" onclick="tutupModalPinBaru(event)">
-  <div class="modal-box">
-    <div class="modal-header">
-      <div class="modal-title">🔑 Buat PIN Baru</div>
-      <div class="modal-subtitle">Akun dipulihkan melalui Google tanpa mengganti data peserta</div>
-      <button class="modal-close" onclick="tutupModalPinBaru()">✕</button>
-    </div>
-    <div class="modal-body">
-      <div class="alert" id="alert-recovery-pin"></div>
-      <div class="form-group"><label class="form-label">PIN Baru *</label><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="recovery-pin-new" placeholder="6 digit PIN"></div>
-      <div class="form-group"><label class="form-label">Ulangi PIN Baru *</label><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="recovery-pin-confirm" placeholder="Ulangi 6 digit PIN" onkeydown="if(event.key==='Enter')simpanPinPemulihan()"></div>
-      <div class="recovery-note">Gunakan PIN yang tidak mudah ditebak. Hindari tanggal lahir, 123456, atau angka berulang.</div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-primary" id="btn-save-recovery-pin" onclick="simpanPinPemulihan()">✅ Simpan PIN Baru</button>
-      <button class="btn btn-outline" onclick="tutupModalPinBaru()">Batal</button>
-    </div>
-  </div>
-</div>
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v2</span></div>
 
 <!-- MODAL SYARAT & KETENTUAN -->
 <div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
