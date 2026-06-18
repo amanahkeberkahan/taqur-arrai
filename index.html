@@ -23,10 +23,18 @@
   5. Paste di bawah ini (ganti semua nilai "GANTI_...")
 ============================================================ -->
 <script type="module">
-import { initializeApp }    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, addDoc, getDocs, doc,
-         updateDoc, query, where, orderBy, serverTimestamp }
-  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import {
+  getFirestore, collection, addDoc, getDocs, getDoc, setDoc, doc,
+  updateDoc, query, where, orderBy, serverTimestamp, writeBatch, limit
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import {
+  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+  createUserWithEmailAndPassword, setPersistence, browserLocalPersistence,
+  browserSessionPersistence, inMemoryPersistence, sendPasswordResetEmail, updatePassword,
+  EmailAuthProvider, reauthenticateWithCredential, GoogleAuthProvider,
+  linkWithPopup, signInWithPopup, deleteUser
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 // ▼▼▼ PASTE CONFIG DI SINI ▼▼▼
 const firebaseConfig = {
@@ -44,13 +52,6 @@ const firebaseConfig = {
 // ⚙️ LANGKAH 2: SESUAIKAN KONFIGURASI PROGRAM
 // ============================================================
 
-// Password login admin (username : password)
-const ADMIN_USERS = {
-  "admin":    { nama: "Admin Utama", pass: "bmk2024",  role: "superadmin" },
-  "petugas1": { nama: "Petugas 1",  pass: "ptgs1",     role: "admin" },
-  "petugas2": { nama: "Petugas 2",  pass: "ptgs2",     role: "admin" },
-};
-
 // Teks estimasi harga default (bisa diubah dari Admin → Setting)
 const DEFAULT_ESTIMASI =
   "🐑 Kambing / Domba mulai Rp 3.500.000 / ekor\n" +
@@ -60,8 +61,19 @@ const DEFAULT_ESTIMASI =
 // ============================================================
 // INISIALISASI FIREBASE
 // ============================================================
-const fbApp  = initializeApp(firebaseConfig);
-const db     = getFirestore(fbApp);
+const fbApp = initializeApp(firebaseConfig);
+const db = getFirestore(fbApp);
+const auth = getAuth(fbApp);
+setPersistence(auth, browserLocalPersistence).catch(console.warn);
+
+// App kedua hanya untuk membuat akun baru tanpa mengubah sesi admin/peserta utama.
+const helperApp = initializeApp(firebaseConfig, 'taqur-helper');
+const helperDb = getFirestore(helperApp);
+const helperAuth = getAuth(helperApp);
+setPersistence(helperAuth, inMemoryPersistence).catch(console.warn);
+
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 // ============================================================
 // UTILS
@@ -69,6 +81,34 @@ const db     = getFirestore(fbApp);
 const rp   = n => 'Rp ' + Number(n||0).toLocaleString('id-ID');
 const pct  = (v,t) => t ? Math.min(100, Math.round(v/t*100)) : 0;
 const normHP = hp => hp.replace(/\D/g,'').replace(/^0/,'62');
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','\"':'&quot;'}[ch]));
+const maskName = nama => {
+  const parts = String(nama||'Peserta').trim().split(/\s+/).filter(Boolean);
+  if (parts.length <= 1) return parts[0] || 'Peserta';
+  return parts[0] + ' ' + parts.slice(1).map(x => x.charAt(0).toUpperCase()+'.').join(' ');
+};
+const pinValid = pin => /^\d{6}$/.test(pin) && !['000000','111111','123456','654321'].includes(pin);
+const randomSuffix = () => Math.random().toString(36).slice(2,8) + Date.now().toString(36).slice(-4);
+const participantAliasEmail = hp => `p.${hp}.${randomSuffix()}@login.taqur.id`;
+const temporaryAdminPassword = () => {
+  const bytes = new Uint32Array(4);
+  crypto.getRandomValues(bytes);
+  return `Tq!${Array.from(bytes).map(n=>n.toString(36)).join('').slice(0,18)}9a`;
+};
+const authMessage = err => {
+  const code = err?.code || '';
+  if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) return 'No. HP atau PIN/password salah.';
+  if (code.includes('too-many-requests')) return 'Terlalu banyak percobaan. Tunggu beberapa saat lalu coba lagi.';
+  if (code.includes('email-already-in-use')) return 'Akun sudah tersedia. Gunakan login atau minta reset PIN ke admin.';
+  if (code.includes('weak-password')) return 'PIN/password belum memenuhi ketentuan keamanan.';
+  if (code.includes('network-request-failed')) return 'Koneksi internet bermasalah.';
+  if (code.includes('popup-closed-by-user')) return 'Proses Google dibatalkan.';
+  if (code.includes('popup-blocked')) return 'Pop-up Google diblokir browser. Izinkan pop-up lalu coba lagi.';
+  if (code.includes('credential-already-in-use')) return 'Akun Google ini sudah terhubung ke akun TaQur lain.';
+  if (code.includes('provider-already-linked')) return 'Pemulihan Google sudah aktif.';
+  if (code.includes('account-exists-with-different-credential')) return 'Email Google ini sudah digunakan oleh metode login lain.';
+  return err?.message || 'Terjadi kesalahan.';
+};
 const tglFmt = ts => {
   if (!ts) return '-';
   const d = ts.toDate ? ts.toDate() : new Date(ts);
@@ -130,11 +170,12 @@ async function getSetting(key, def) {
   } catch { return def; }
 }
 async function setSetting(key, value) {
+  if (currentAdmin?.role !== 'superadmin') throw new Error('Hanya Super Admin yang dapat mengubah pengaturan.');
   const snap = await getDocs(query(collection(db,'settings'), where('key','==',key)));
   if (snap.empty) {
-    await addDoc(collection(db,'settings'), { key, value });
+    await addDoc(collection(db,'settings'), { key, value, updatedAt:serverTimestamp(), updatedBy:auth.currentUser?.uid||'' });
   } else {
-    await updateDoc(doc(db,'settings',snap.docs[0].id), { value });
+    await updateDoc(doc(db,'settings',snap.docs[0].id), { value, updatedAt:serverTimestamp(), updatedBy:auth.currentUser?.uid||'' });
   }
 }
 
@@ -142,76 +183,69 @@ async function setSetting(key, value) {
 // NAV
 // ============================================================
 let currentAdmin = null;
+let currentParticipant = null;
 window.showPage = function(id) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-'+id).classList.add('active');
-  document.querySelector(`.nav-tab[data-page="${id}"]`).classList.add('active');
+  document.querySelector(`.nav-tab[data-page="${id}"]`)?.classList.add('active');
   if (id==='dashboard') loadDashboard();
   if (id==='admin' && currentAdmin) renderAdminPanel();
   if (id==='daftar') { loadEstimasiDisplay(); renderPaketDaftar(); }
   if (id==='setor') document.getElementById('setor-tgl').value = new Date().toISOString().split('T')[0];
+  fillParticipantFields();
+  if (currentParticipant) {
+    if (id==='va') renderVAResult(currentParticipant);
+    if (id==='setor') renderSetorParticipant(currentParticipant);
+    if (id==='cek') loadSaldoForParticipant(currentParticipant).catch(e=>showAlert('alert-cek','error',authMessage(e)));
+  }
 };
 
 // ============================================================
-// DASHBOARD
+// DASHBOARD PUBLIK — hanya membaca dokumen ringkasan tanpa data pribadi
 // ============================================================
 async function loadDashboard() {
   try {
-    const [pSnap, sSnap] = await Promise.all([
-      getDocs(collection(db,'peserta')),
-      getDocs(query(collection(db,'setoran'), where('status','==','confirmed')))
+    const [statSnap, topSnap] = await Promise.all([
+      getDoc(doc(db,'public_stats','overview')),
+      getDoc(doc(db,'leaderboard_public','top5'))
     ]);
-    const peserta   = pSnap.docs.map(d => ({id:d.id,...d.data()})).filter(p => !p.deleted);
-    const confirmed = sSnap.docs.map(d => d.data());
-    const totalDana   = confirmed.reduce((a,s) => a+s.nominal, 0);
-    const totalTarget = peserta.reduce((a,p) => a+(p.targetNominal||0), 0);
-    const pc = pct(totalDana, totalTarget);
+    const stat = statSnap.exists() ? statSnap.data() : {};
+    const peserta = Number(stat.totalPeserta||0);
+    const totalDana = Number(stat.totalDana||0);
+    const totalTarget = Number(stat.totalTarget||0);
+    const pc = pct(totalDana,totalTarget);
 
-    document.getElementById('dash-peserta').textContent  = peserta.length;
-    document.getElementById('dash-total').textContent    = rp(totalDana);
-    document.getElementById('dash-pct').textContent      = pc+'%';
-    document.getElementById('dash-collected').textContent= 'Terkumpul: '+rp(totalDana);
-    document.getElementById('dash-pct2').textContent     = pc+'%';
-    document.getElementById('dash-bar').style.width      = pc+'%';
+    document.getElementById('dash-peserta').textContent = peserta;
+    document.getElementById('dash-total').textContent = rp(totalDana);
+    document.getElementById('dash-pct').textContent = pc+'%';
+    document.getElementById('dash-collected').textContent = 'Terkumpul: '+rp(totalDana);
+    document.getElementById('dash-pct2').textContent = pc+'%';
+    document.getElementById('dash-bar').style.width = pc+'%';
     document.getElementById('dash-target-label').textContent = 'Target kolektif: '+rp(totalTarget);
-    document.getElementById('dash-target-sub').textContent   =
-      `${peserta.length} peserta · rata-rata ${peserta.length ? rp(Math.round(totalTarget/peserta.length)) : rp(0)} / orang`;
+    document.getElementById('dash-target-sub').textContent = `${peserta} peserta · data publik terakhir disinkronkan admin`;
 
-    // TOP 5
-    const top5El  = document.getElementById('dash-top5');
-    const seeBtn  = document.getElementById('see-all-btn');
-    if (!peserta.length) {
-      top5El.innerHTML = '<div class="empty-state"><div class="ei">🐑</div><p>Belum ada peserta.<br>Jadilah yang pertama!</p></div>';
-      seeBtn.style.display = 'none';
+    const items = topSnap.exists() && Array.isArray(topSnap.data().items) ? topSnap.data().items : [];
+    const top5El = document.getElementById('dash-top5');
+    const seeBtn = document.getElementById('see-all-btn');
+    seeBtn.style.display='none';
+    if (!items.length) {
+      top5El.innerHTML='<div class="empty-state"><div class="ei">🐑</div><p>Belum ada data leaderboard publik.</p></div>';
       return;
     }
-    const sorted = peserta.map(p => ({
-      ...p,
-      saldo: confirmed.filter(s=>s.pesertaId===p.id).reduce((a,s)=>a+s.nominal,0)
-    })).sort((a,b) => b.saldo - a.saldo);
-
-    const rankClass = ['rank-1','rank-2','rank-3','rank-n','rank-n'];
-    const rankLabel = ['🥇','🥈','🥉','4','5'];
-    top5El.innerHTML = sorted.slice(0,5).map((p,i) => {
-      const pc2 = pct(p.saldo, p.targetNominal||3500000);
-      return `<div class="top-item">
-        <div class="top-rank ${rankClass[i]}">${rankLabel[i]}</div>
-        <div class="top-info">
-          <div class="top-nama">${p.nama}</div>
-          <div class="top-jenis">${p.jenis}</div>
-          <div class="mini-bar" style="margin-top:3px"><div class="mini-fill" style="width:${pc2}%"></div></div>
-        </div>
-        <div class="top-saldo">
-          <div class="top-nom">${rp(p.saldo)}</div>
-          <div class="top-pct">${pc2}% target</div>
-        </div>
-      </div>`;
-    }).join('');
-    seeBtn.style.display = peserta.length > 5 ? 'block' : 'none';
+    const rankClass=['rank-1','rank-2','rank-3','rank-n','rank-n'];
+    const rankLabel=['🥇','🥈','🥉','4','5'];
+    top5El.innerHTML=items.slice(0,5).map((p,i)=>`<div class="top-item">
+      <div class="top-rank ${rankClass[i]}">${rankLabel[i]}</div>
+      <div class="top-info">
+        <div class="top-nama">${esc(p.namaMasked)}</div>
+        <div class="top-jenis">${esc(p.jenis)}</div>
+        <div class="mini-bar" style="margin-top:3px"><div class="mini-fill" style="width:${Number(p.progress||0)}%"></div></div>
+      </div>
+      <div class="top-saldo"><div class="top-nom">${rp(p.saldo)}</div><div class="top-pct">${Number(p.progress||0)}% target</div></div>
+    </div>`).join('');
   } catch(e) {
-    document.getElementById('dash-top5').innerHTML =
-      `<div class="empty-state"><p>⚠️ Koneksi Firebase gagal.<br><small>${e.message}</small></p></div>`;
+    document.getElementById('dash-top5').innerHTML='<div class="empty-state"><p>⚠️ Dashboard publik belum tersedia.<br><small>Admin perlu melakukan sinkronisasi awal.</small></p></div>';
   }
 }
 
@@ -333,297 +367,531 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ============================================================
-// DAFTAR PESERTA
+// AUTH, AUDIT, DAN AKUN PESERTA
+// ============================================================
+async function writeAudit(action, targetType='', targetId='', details={}) {
+  if (!auth.currentUser) return;
+  const actor = currentAdmin ? {nama:currentAdmin.nama, role:currentAdmin.role}
+    : currentParticipant ? {nama:currentParticipant.nama, role:'participant'}
+    : {nama:auth.currentUser.email||'User', role:'unknown'};
+  try {
+    await addDoc(collection(db,'audit_logs'), {
+      action, targetType, targetId,
+      actorUid: auth.currentUser.uid,
+      actorName: actor.nama,
+      actorRole: actor.role,
+      details,
+      timestamp: serverTimestamp()
+    });
+  } catch(e) { console.warn('Audit log gagal:',e); }
+}
+
+async function getCurrentParticipant() {
+  const user = auth.currentUser;
+  if (!user) return null;
+  const userSnap = await getDoc(doc(db,'users',user.uid));
+  if (!userSnap.exists()) return null;
+  const u = userSnap.data();
+  if (u.role!=='participant' || u.active!==true || !u.participantId) return null;
+  const pSnap = await getDoc(doc(db,'peserta',u.participantId));
+  if (!pSnap.exists() || pSnap.data().deleted) return null;
+  return {
+    id:pSnap.id,...pSnap.data(),uid:user.uid,
+    loginEmail:u.loginEmail||'',
+    recoveryProvider:u.recoveryProvider||'',
+    recoveryEmail:u.recoveryEmail||''
+  };
+}
+
+async function signInParticipant(hp, pin, alertId) {
+  hp = normHP(hp||'');
+  if (!hp || hp.length<10) throw new Error('Masukkan No. HP yang valid.');
+  if (currentParticipant && currentParticipant.hp===hp && auth.currentUser) return currentParticipant;
+  if (!/^\d{6}$/.test(pin||'')) throw new Error('PIN harus 6 digit angka.');
+  if (auth.currentUser) await signOut(auth);
+  await setPersistence(auth,browserSessionPersistence);
+  const lookup = await getDoc(doc(db,'login_lookup',hp));
+  if (!lookup.exists()) throw new Error('No. HP belum terdaftar.');
+  const l = lookup.data();
+  if (!l.loginEmail || l.active!==true) throw new Error('Akun peserta belum diaktifkan. Hubungi admin untuk membuat/reset PIN.');
+  try {
+    await signInWithEmailAndPassword(auth,l.loginEmail,pin);
+    currentParticipant = await getCurrentParticipant();
+    if (!currentParticipant) throw new Error('Akun peserta tidak aktif atau data tidak ditemukan.');
+    currentAdmin=null;
+    fillParticipantFields();
+    startParticipantIdleTimer();
+    return currentParticipant;
+  } catch(e) {
+    await signOut(auth).catch(()=>{});
+    currentParticipant=null;
+    throw new Error(authMessage(e));
+  }
+}
+
+async function participantForAction(hp, pin) {
+  if (auth.currentUser && currentParticipant) return currentParticipant;
+  return signInParticipant(hp,pin);
+}
+
+function setParticipantLoginVisibility(loggedIn) {
+  document.querySelectorAll('.participant-session-bar').forEach(el=>el.style.display=loggedIn?'flex':'none');
+  document.querySelectorAll('.participant-login-card').forEach(el=>el.style.display=loggedIn?'none':'block');
+  document.querySelectorAll('.participant-login-fields').forEach(el=>el.style.display=loggedIn?'none':'block');
+  document.querySelectorAll('.participant-protected-content').forEach(el=>el.style.display=loggedIn?'block':'none');
+}
+
+let participantIdleTimer=null;
+const PARTICIPANT_IDLE_MS=30*60*1000;
+function startParticipantIdleTimer(){
+  clearTimeout(participantIdleTimer);
+  if(!currentParticipant) return;
+  participantIdleTimer=setTimeout(async()=>{
+    if(!currentParticipant) return;
+    alert('Sesi peserta berakhir karena tidak ada aktivitas selama 30 menit. Silakan masuk kembali.');
+    await pesertaLogout();
+  },PARTICIPANT_IDLE_MS);
+}
+['click','touchstart','keydown'].forEach(evt=>document.addEventListener(evt,()=>{if(currentParticipant)startParticipantIdleTimer();},{passive:true}));
+
+function googleRecoveryLinked() {
+  return !!auth.currentUser?.providerData?.some(p=>p.providerId==='google.com');
+}
+
+function updateParticipantRecoveryUI() {
+  const linked = googleRecoveryLinked();
+  document.querySelectorAll('.participant-recovery-btn').forEach(btn=>{
+    btn.textContent = linked ? '✅ Google Aktif' : '🔑 Aktifkan Google';
+    btn.title = linked
+      ? 'Akun Google sudah terhubung untuk pemulihan PIN'
+      : 'Hubungkan akun Google agar PIN bisa dipulihkan tanpa admin';
+  });
+}
+
+function fillParticipantFields() {
+  if (!currentParticipant) { setParticipantLoginVisibility(false); return; }
+  ['va-hp','setor-hp','cek-hp'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=currentParticipant.hp; });
+  document.querySelectorAll('.participant-session-name').forEach(el=>el.textContent='Masuk sebagai '+currentParticipant.nama);
+  setParticipantLoginVisibility(true);
+  updateParticipantRecoveryUI();
+  if (typeof renderSetorParticipant === 'function') renderSetorParticipant(currentParticipant);
+}
+
+window.pesertaLogout = async function() {
+  clearTimeout(participantIdleTimer);
+  await signOut(auth).catch(()=>{});
+  currentParticipant=null;
+  ['va-hp','va-pin','setor-hp','setor-pin','cek-hp','cek-pin'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  setParticipantLoginVisibility(false);
+  document.getElementById('saldo-result').style.display='none';
+  document.getElementById('va-result').innerHTML='';
+  document.getElementById('setor-info').style.display='none';
+  const notify=document.getElementById('setor-notify'); if(notify){notify.innerHTML='';notify.style.display='none';}
+  selPeserta=null;
+  showPage('dashboard');
+};
+
+window.ubahPinSaya = async function() {
+  if (!auth.currentUser || !currentParticipant) return alert('Silakan login sebagai peserta terlebih dahulu.');
+  const lama = prompt('Masukkan PIN lama (6 digit):');
+  if (lama===null) return;
+  const baru = prompt('Masukkan PIN baru (6 digit, hindari 123456/angka berulang):');
+  if (baru===null) return;
+  if (!pinValid(baru)) return alert('PIN baru harus 6 digit dan tidak boleh terlalu mudah.');
+  try {
+    const loginEmail = currentParticipant.loginEmail || auth.currentUser.email;
+    const credential = EmailAuthProvider.credential(loginEmail,lama);
+    await reauthenticateWithCredential(auth.currentUser,credential);
+    await updatePassword(auth.currentUser,baru);
+    await writeAudit('PARTICIPANT_CHANGE_PIN','peserta',currentParticipant.id,{method:'old-pin'});
+    alert('✅ PIN berhasil diubah.');
+  } catch(e) { alert('Gagal mengubah PIN: '+authMessage(e)); }
+};
+
+window.aktifkanPemulihanGoogle = async function() {
+  if (!auth.currentUser || !currentParticipant) return alert('Silakan login sebagai peserta terlebih dahulu.');
+  if (googleRecoveryLinked()) {
+    const googleData = auth.currentUser.providerData.find(p=>p.providerId==='google.com');
+    return alert(`✅ Pemulihan Google sudah aktif${googleData?.email ? ` untuk ${googleData.email}` : ''}.`);
+  }
+  try {
+    const result = await linkWithPopup(auth.currentUser, googleProvider);
+    const googleData = result.user.providerData.find(p=>p.providerId==='google.com');
+    await updateDoc(doc(db,'users',result.user.uid),{
+      recoveryProvider:'google.com',
+      recoveryEmail:googleData?.email||'',
+      recoveryLinkedAt:serverTimestamp()
+    });
+    currentParticipant = await getCurrentParticipant();
+    updateParticipantRecoveryUI();
+    await writeAudit('PARTICIPANT_LINK_GOOGLE','peserta',currentParticipant.id,{
+      recoveryEmail:googleData?.email||''
+    });
+    alert('✅ Pemulihan Google aktif. Jika lupa PIN, pilih “Pulihkan dengan Google”.');
+  } catch(e) {
+    alert('Gagal mengaktifkan pemulihan Google: '+authMessage(e));
+  }
+};
+
+let pinRecoveryMode = false;
+
+function bukaModalPinBaru() {
+  pinRecoveryMode = true;
+  const modal = document.getElementById('modal-reset-pin');
+  document.getElementById('recovery-pin-new').value='';
+  document.getElementById('recovery-pin-confirm').value='';
+  document.getElementById('alert-recovery-pin').className='alert';
+  modal.classList.add('open');
+  document.body.style.overflow='hidden';
+}
+
+window.tutupModalPinBaru = function(e) {
+  if (e && e.target !== document.getElementById('modal-reset-pin')) return;
+  document.getElementById('modal-reset-pin').classList.remove('open');
+  document.body.style.overflow='';
+  pinRecoveryMode=false;
+};
+
+window.lupaPinPeserta = async function() {
+  try {
+    if (auth.currentUser) await signOut(auth);
+    currentAdmin=null;
+    currentParticipant=null;
+    setParticipantLoginVisibility(false);
+    await setPersistence(auth,browserSessionPersistence);
+    const result = await signInWithPopup(auth,googleProvider);
+    const profileSnap = await getDoc(doc(db,'users',result.user.uid));
+    if (!profileSnap.exists()) {
+      await deleteUser(result.user).catch(()=>{});
+      throw new Error('Akun Google ini belum pernah dihubungkan ke peserta TaQur.');
+    }
+    const profile = profileSnap.data();
+    if (profile.role!=='participant' || profile.active!==true) {
+      await signOut(auth).catch(()=>{});
+      throw new Error('Akun Google ini bukan akun pemulihan peserta.');
+    }
+    currentParticipant = await getCurrentParticipant();
+    if (!currentParticipant) {
+      await signOut(auth).catch(()=>{});
+      throw new Error('Data peserta tidak ditemukan atau akun tidak aktif.');
+    }
+    fillParticipantFields();
+    startParticipantIdleTimer();
+    bukaModalPinBaru();
+  } catch(e) {
+    await signOut(auth).catch(()=>{});
+    currentParticipant=null;
+    alert('Pemulihan gagal: '+authMessage(e));
+  }
+};
+
+window.simpanPinPemulihan = async function() {
+  if (!pinRecoveryMode || !auth.currentUser || !currentParticipant) return;
+  const pin=document.getElementById('recovery-pin-new').value.trim();
+  const pin2=document.getElementById('recovery-pin-confirm').value.trim();
+  if(!pinValid(pin)) return showAlert('alert-recovery-pin','error','PIN harus 6 digit dan tidak boleh terlalu mudah.');
+  if(pin!==pin2) return showAlert('alert-recovery-pin','error','Konfirmasi PIN tidak sama.');
+  setLoading('btn-save-recovery-pin',true);
+  try {
+    await updatePassword(auth.currentUser,pin);
+    await writeAudit('PARTICIPANT_RESET_PIN_GOOGLE','peserta',currentParticipant.id,{method:'google'});
+    document.getElementById('modal-reset-pin').classList.remove('open');
+    document.body.style.overflow='';
+    pinRecoveryMode=false;
+    alert('✅ PIN baru berhasil dibuat. Akun tetap sama dan seluruh data tetap terhubung.');
+  } catch(e) {
+    showAlert('alert-recovery-pin','error','Gagal membuat PIN baru: '+authMessage(e));
+  }
+  setLoading('btn-save-recovery-pin',false);
+};
+
+// ============================================================
+// DAFTAR PESERTA — membuat Firebase Auth + dokumen peserta secara atomik
 // ============================================================
 window.daftarPeserta = async function() {
-  const nama   = document.getElementById('daftar-nama').value.trim();
-  const hp     = normHP(document.getElementById('daftar-hp').value.trim());
-  const alamat = document.getElementById('daftar-alamat').value.trim();
-  const jenis  = document.getElementById('daftar-jenis').value;
-  const target = parseInt(document.getElementById('daftar-target').value);
-
-  if (!nama)              return showAlert('alert-daftar','error','Nama tidak boleh kosong.');
-  if (!hp||hp.length<10)  return showAlert('alert-daftar','error','No. HP tidak valid.');
-  if (!alamat||alamat.length<10) return showAlert('alert-daftar','error','Mohon isi alamat lengkap (jalan, kelurahan, kecamatan).');
-  if (!jenis)             return showAlert('alert-daftar','error','Pilih paket tabungan terlebih dahulu.');
-  if (!target||target<1) return showAlert('alert-daftar','error','Target nominal wajib diisi.');
-
-  setLoading('btn-daftar', true);
+  const nama=document.getElementById('daftar-nama').value.trim();
+  const hp=normHP(document.getElementById('daftar-hp').value.trim());
+  const alamat=document.getElementById('daftar-alamat').value.trim();
+  const jenis=document.getElementById('daftar-jenis').value;
+  const target=parseInt(document.getElementById('daftar-target').value);
+  const pin=document.getElementById('daftar-pin').value.trim();
+  const pin2=document.getElementById('daftar-pin2').value.trim();
+  if(!nama) return showAlert('alert-daftar','error','Nama tidak boleh kosong.');
+  if(!hp||hp.length<10) return showAlert('alert-daftar','error','No. HP tidak valid.');
+  if(!alamat||alamat.length<10) return showAlert('alert-daftar','error','Mohon isi alamat lengkap.');
+  if(!jenis) return showAlert('alert-daftar','error','Pilih paket tabungan terlebih dahulu.');
+  if(!target||target<1) return showAlert('alert-daftar','error','Target nominal wajib diisi.');
+  if(!pinValid(pin)) return showAlert('alert-daftar','error','PIN harus 6 digit dan tidak boleh terlalu mudah.');
+  if(pin!==pin2) return showAlert('alert-daftar','error','Konfirmasi PIN tidak sama.');
+  setLoading('btn-daftar',true);
   try {
-    const cek = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
-    const aktif = cek.docs.filter(d => !d.data().deleted);
-    if (aktif.length > 0) {
-      showAlert('alert-daftar','error','No. HP sudah terdaftar.');
-      setLoading('btn-daftar', false);
-      return;
-    }
-    await addDoc(collection(db,'peserta'), {
-      nama, hp, alamat, jenis, targetNominal: target,
-      nomorVA: '', tglDaftar: serverTimestamp()
+    const existing=await getDoc(doc(db,'login_lookup',hp));
+    if(existing.exists()) throw new Error('No. HP sudah terdaftar. Gunakan login atau hubungi admin.');
+    await signOut(helperAuth).catch(()=>{});
+    const loginEmail=participantAliasEmail(hp);
+    const cred=await createUserWithEmailAndPassword(helperAuth,loginEmail,pin);
+    const uid=cred.user.uid;
+    const batch=writeBatch(helperDb);
+    batch.set(doc(helperDb,'users',uid),{
+      nama,hp,role:'participant',active:true,participantId:uid,loginEmail,
+      createdAt:serverTimestamp(),createdBy:'self-registration'
     });
-    ['daftar-nama','daftar-hp','daftar-alamat'].forEach(id => document.getElementById(id).value='');
+    batch.set(doc(helperDb,'peserta',uid),{
+      nama,hp,alamat,jenis,targetNominal:target,nomorVA:'',authUid:uid,
+      statusAkun:'active',tglDaftar:serverTimestamp()
+    });
+    batch.set(doc(helperDb,'login_lookup',hp),{
+      hp,uid,participantId:uid,loginEmail,active:true,registered:true,updatedAt:serverTimestamp()
+    });
+    await batch.commit();
+    await addDoc(collection(helperDb,'audit_logs'),{
+      action:'PARTICIPANT_REGISTER',targetType:'peserta',targetId:uid,
+      actorUid:uid,actorName:nama,actorRole:'participant',details:{jenis,targetNominal:target},timestamp:serverTimestamp()
+    });
+    await signOut(helperAuth);
+    ['daftar-nama','daftar-hp','daftar-alamat','daftar-pin','daftar-pin2'].forEach(id=>document.getElementById(id).value='');
     document.getElementById('daftar-jenis').value='';
     document.getElementById('daftar-target').value='';
     document.getElementById('custom-target-input').value='';
     document.getElementById('custom-hint').style.display='none';
     document.getElementById('paket-selected-info').style.display='none';
-    document.querySelectorAll('.paket-list-item').forEach(c => c.classList.remove('selected'));
-    const cb = document.getElementById('setuju-sk');
-    cb.checked = false; cb.disabled = true;
-    toggleBtnDaftar();
-    document.getElementById('sk-hint').style.display='none';
-    const sukses = document.getElementById('daftar-sukses');
-    sukses.style.display = 'block';
-    sukses.scrollIntoView({behavior:'smooth'});
-    await loadPesertaCache();
-  } catch(e) { showAlert('alert-daftar','error','Gagal mendaftar: '+e.message); }
-  setLoading('btn-daftar', false);
+    document.querySelectorAll('.paket-list-item').forEach(c=>c.classList.remove('selected'));
+    const cb=document.getElementById('setuju-sk'); cb.checked=false; cb.disabled=true; toggleBtnDaftar();
+    document.getElementById('daftar-sukses').style.display='block';
+    document.getElementById('daftar-sukses').scrollIntoView({behavior:'smooth'});
+  } catch(e) {
+    await signOut(helperAuth).catch(()=>{});
+    showAlert('alert-daftar','error','Gagal mendaftar: '+authMessage(e));
+  }
+  setLoading('btn-daftar',false);
 };
 
-// ============================================================
-// PESERTA CACHE (untuk autocomplete setor)
-// ============================================================
-let pesertaCache = [];
-async function loadPesertaCache() {
-  const snap = await getDocs(collection(db,'peserta'));
-  pesertaCache = snap.docs.map(d => ({id:d.id,...d.data()})).filter(p => !p.deleted);
+let pesertaCache=[];
+async function loadPesertaCache(){
+  if(!currentAdmin) return;
+  const snap=await getDocs(collection(db,'peserta'));
+  pesertaCache=snap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);
 }
-loadPesertaCache();
 
 // ============================================================
 // CEK VA
 // ============================================================
-window.cekVA = async function() {
-  const hp    = normHP(document.getElementById('va-hp').value.trim());
-  const resEl = document.getElementById('va-result');
-  if (!hp||hp.length<10) { showAlert('alert-va','error','Masukkan No. HP yang valid.'); return; }
-  showAlert('alert-va','info','⏳ Mencari data...');
-  try {
-    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
-    const aktivDocs = snap.docs.filter(d => !d.data().deleted);
-    if (!aktivDocs.length) { showAlert('alert-va','error','No. HP tidak ditemukan. Pastikan sudah mendaftar.'); resEl.innerHTML=''; return; }
+function renderVAResult(p){
+  const resEl=document.getElementById('va-result');
+  if(!p.nomorVA){
+    resEl.innerHTML=`<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center">
+      <div style="font-size:36px;margin-bottom:8px">⏳</div><div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Belum Tersedia</div>
+      <div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6">Halo <strong>${esc(p.nama)}</strong>, No. VA BSI Anda sedang disiapkan admin.</div></div>`;
+  }else{
+    resEl.innerHTML=`<div class="va-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Virtual Account BSI</div>
+      <div class="va-number">${esc(p.nomorVA)}</div><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div>
+      <div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div>
+      <div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div></div></div>
+      <div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div>`;
+  }
+  resEl.style.display='block';
+}
+
+window.cekVA=async function(){
+  const hp=document.getElementById('va-hp').value.trim();
+  const pin=document.getElementById('va-pin').value.trim();
+  const resEl=document.getElementById('va-result');
+  if(!currentParticipant) showAlert('alert-va','info','⏳ Memverifikasi akun...');
+  try{
+    const p=await participantForAction(hp,pin);
     document.getElementById('alert-va').classList.remove('show');
-    const p = {id:aktivDocs[0].id,...aktivDocs[0].data()};
-    if (!p.nomorVA) {
-      resEl.innerHTML = `<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center">
-        <div style="font-size:36px;margin-bottom:8px">⏳</div>
-        <div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Belum Tersedia</div>
-        <div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6;margin-bottom:14px">Halo <strong>${p.nama}</strong>, No. VA BSI Anda sedang disiapkan admin.</div>
-        <div style="background:rgba(201,168,76,.15);border-radius:10px;padding:12px;border:1px solid rgba(201,168,76,.3);font-size:12px;color:rgba(255,255,255,.8)">
-          <div style="color:var(--emas);font-weight:700;margin-bottom:4px">📞 Hubungi Admin TaQur Ar-Ra'i</div>
-          <div id="kontak-setor-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:var(--emas-light);text-decoration:none">📱 Aynur: +62 821-3969-1445</a><br><a href="https://wa.me/6285733844255" target="_blank" style="color:var(--emas-light);text-decoration:none">📱 Chandra: +62 857-3384-4255</a></div>
-        </div>
-      </div>`;
-    } else {
-      resEl.innerHTML = `
-        <div class="va-card">
-          <div class="va-bank">🏦 Bank Syariah Indonesia</div>
-          <div class="va-label">Virtual Account BSI</div>
-          <div class="va-number">${p.nomorVA}</div>
-          <div class="va-owner">
-            <div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div>
-            <div style="font-size:15px;font-weight:700;color:var(--emas-light)">${p.nama}</div>
-            <div style="font-size:11px;color:rgba(255,255,255,.5)">${p.jenis}</div>
-            <div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div>
-          </div>
-        </div>
-        <div class="va-steps">
-          <div class="va-step"><span class="vs-num">1</span><span>Buka aplikasi BSI Mobile / m-Banking manapun</span></div>
-          <div class="va-step"><span class="vs-num">2</span><span>Pilih menu <strong>Transfer → Virtual Account</strong></span></div>
-          <div class="va-step"><span class="vs-num">3</span><span>Masukkan nomor VA di atas</span></div>
-          <div class="va-step"><span class="vs-num">4</span><span>Masukkan nominal sesuai pilihan nabung Anda</span></div>
-          <div class="va-step"><span class="vs-num">5</span><span>Buka menu <strong>Setor</strong> untuk konfirmasi pembayaran ke admin</span></div>
-        </div>
-        <div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div>`;
+    renderVAResult(p);
+  }catch(e){showAlert('alert-va','error',authMessage(e));resEl.innerHTML='';}
+};
+
+// ============================================================
+// SETOR — laporan peserta, saldo hanya berubah setelah verifikasi admin
+// ============================================================
+let selPeserta=null;
+function renderSetorParticipant(p){
+  if(!p) return;
+  selPeserta=p;
+  const el=document.getElementById('setor-info');
+  el.innerHTML=`<div class="peserta-found"><div class="avatar" style="width:32px;height:32px;font-size:14px">${esc(p.nama.charAt(0).toUpperCase())}</div>
+    <div style="flex:1"><div style="font-weight:700;font-size:13px;color:var(--hijau)">✅ ${esc(p.nama)}</div>
+    <div style="font-size:11px;color:#888">${esc(p.jenis)}</div><div style="font-size:11px;color:var(--hijau-mid)">🎯 Target: ${rp(p.targetNominal||0)}</div>
+    <div style="font-size:11px;color:${p.nomorVA?'var(--hijau-mid)':'#e65100'}">${p.nomorVA?'🏦 VA BSI: '+esc(p.nomorVA):'⚠️ No. VA belum diassign'}</div></div></div>`;
+  el.style.display='block';
+}
+
+window.cariPesertaSetor=async function(){
+  const hp=document.getElementById('setor-hp').value.trim();
+  const pin=document.getElementById('setor-pin').value.trim();
+  const el=document.getElementById('setor-info');
+  try{
+    const p=await participantForAction(hp,pin);
+    renderSetorParticipant(p);
+  }catch(e){selPeserta=null;el.style.display='none';showAlert('alert-setor','error',authMessage(e));}
+};
+
+async function renderAdminNotifyButtons(p,nominal,tgl){
+  const box=document.getElementById('setor-notify');
+  if(!box) return;
+  try{
+    const raw=await getSetting('kontak_admin',DEFAULT_KONTAK);
+    const list=JSON.parse(raw||'[]');
+    const msg=`Assalamu'alaikum Admin TaQur. Saya ${p.nama} telah melaporkan setoran ${rp(nominal)} tanggal ${tgl}. Mohon cek mutasi/Virtual Account dan lakukan konfirmasi di dashboard admin. Laporan ini belum berarti saldo telah bertambah.`;
+    box.innerHTML=`<div style="font-size:12px;font-weight:700;color:var(--hijau);margin-bottom:7px">📣 Bantu admin mengecek lebih cepat:</div>`+
+      list.map(k=>`<a class="btn btn-outline btn-sm" style="display:block;text-align:center;margin-top:6px;text-decoration:none" target="_blank" rel="noopener" href="https://wa.me/${encodeURIComponent(k.hp)}?text=${encodeURIComponent(msg)}">Kirim WhatsApp ke ${esc(k.nama)}</a>`).join('');
+    box.style.display=list.length?'block':'none';
+  }catch(e){console.warn('Gagal memuat kontak admin',e);}
+}
+
+window.inputSetoran=async function(){
+  const nominal=parseInt(document.getElementById('setor-nominal').value.replace(/\D/g,''));
+  const tgl=document.getElementById('setor-tgl').value;
+  const catatan=document.getElementById('setor-catatan').value.trim();
+  if(!selPeserta||!currentParticipant||!auth.currentUser) return showAlert('alert-setor','error','Silakan masuk sebagai peserta terlebih dahulu.');
+  if(!nominal||nominal<1000) return showAlert('alert-setor','error','Nominal minimal Rp 1.000.');
+  if(!tgl) return showAlert('alert-setor','error','Tanggal wajib diisi.');
+  setLoading('btn-setor',true);
+  try{
+    const ownSnap=await getDocs(query(collection(db,'setoran'),where('ownerUid','==',auth.currentUser.uid),where('pesertaId','==',selPeserta.id)));
+    const duplicate=ownSnap.docs.map(d=>d.data()).some(x=>x.status!=='rejected'&&x.status!=='deleted'&&Number(x.nominal||0)===nominal&&x.tgl===tgl);
+    if(duplicate&&!confirm('Ada laporan setoran dengan tanggal dan nominal yang sama. Tetap kirim sebagai setoran baru?')){
+      setLoading('btn-setor',false); return;
     }
-    resEl.style.display = 'block';
-  } catch(e) { showAlert('alert-va','error','Gagal: '+e.message); }
-};
-
-// ============================================================
-// SETOR
-// ============================================================
-let selPeserta = null;
-
-window.cariPesertaSetor = async function() {
-  const hp = normHP(document.getElementById('setor-hp').value.trim());
-  const el = document.getElementById('setor-info');
-  if (!hp||hp.length<10) { el.innerHTML=''; el.style.display='none'; selPeserta=null; return; }
-  let p = pesertaCache.find(x => x.hp===hp);
-  if (!p) {
-    // fallback: query firestore
-    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
-    const aktif = snap.docs.filter(d => !d.data().deleted);
-    if (aktif.length) p = {id:aktif[0].id,...aktif[0].data()};
-  }
-  if (p) {
-    selPeserta = p;
-    const vaInfo = p.nomorVA
-      ? `<div style="font-size:11px;color:var(--hijau-mid)">🏦 VA BSI: <strong>${p.nomorVA}</strong></div>`
-      : `<div style="font-size:11px;color:#e65100">⚠️ No. VA belum diassign — hubungi admin</div>`;
-    el.innerHTML = `<div class="peserta-found">
-      <div class="avatar" style="width:32px;height:32px;font-size:14px">${p.nama.charAt(0).toUpperCase()}</div>
-      <div style="flex:1">
-        <div style="font-weight:700;font-size:13px;color:var(--hijau)">✅ ${p.nama}</div>
-        <div style="font-size:11px;color:#888">${p.jenis}</div>
-        <div style="font-size:11px;color:var(--hijau-mid)">🎯 Target: ${rp(p.targetNominal||0)}</div>
-        ${vaInfo}
-      </div>
-    </div>`;
-  } else {
-    selPeserta = null;
-    el.innerHTML = `<div style="padding:8px 12px;background:#fde8e8;border-radius:8px;font-size:12px;color:#c62828">❌ No. HP tidak ditemukan. Pastikan sudah mendaftar.</div>`;
-  }
-  el.style.display = 'block';
-};
-
-window.inputSetoran = async function() {
-  const nominal = parseInt(document.getElementById('setor-nominal').value.replace(/\D/g,''));
-  const tgl     = document.getElementById('setor-tgl').value;
-  const catatan = document.getElementById('setor-catatan').value.trim();
-  if (!selPeserta)            return showAlert('alert-setor','error','Masukkan No. HP dan pastikan peserta ditemukan.');
-  if (!nominal||nominal<1000) return showAlert('alert-setor','error','Nominal minimal Rp 1.000.');
-  if (!tgl)                   return showAlert('alert-setor','error','Tanggal wajib diisi.');
-
-  setLoading('btn-setor', true);
-  try {
-    await addDoc(collection(db,'setoran'), {
-      pesertaId: selPeserta.id, nama: selPeserta.nama, hp: selPeserta.hp,
-      nomorVA: selPeserta.nomorVA||'', nominal, tgl, catatan,
-      cara: 'Transfer VA BSI', status: 'pending', tglInput: serverTimestamp()
+    const ref=await addDoc(collection(db,'setoran'),{
+      pesertaId:selPeserta.id,ownerUid:auth.currentUser.uid,nama:selPeserta.nama,hp:selPeserta.hp,
+      nomorVA:selPeserta.nomorVA||'',nominal,tgl,catatan,cara:'Transfer VA BSI',status:'pending',tglInput:serverTimestamp()
     });
-    document.getElementById('setor-hp').value='';
+    await writeAudit('PARTICIPANT_SUBMIT_SETORAN','setoran',ref.id,{nominal,tgl});
     document.getElementById('setor-nominal').value='';
     document.getElementById('setor-catatan').value='';
-    document.getElementById('setor-info').style.display='none';
-    selPeserta = null;
-    await updateBadge();
-    showAlert('alert-setor','success','✅ Setoran dikirim! Menunggu konfirmasi admin. Saldo terupdate setelah disetujui.');
-  } catch(e) { showAlert('alert-setor','error','Gagal: '+e.message); }
-  setLoading('btn-setor', false);
+    showAlert('alert-setor','success','✅ Laporan setoran terkirim. Saldo belum bertambah sampai admin mencocokkan dana di mutasi/VA.');
+    await renderAdminNotifyButtons(selPeserta,nominal,tgl);
+  }catch(e){showAlert('alert-setor','error','Gagal: '+authMessage(e));}
+  setLoading('btn-setor',false);
 };
 
 // ============================================================
 // CEK SALDO
 // ============================================================
-window.cekSaldo = async function() {
-  const hp    = normHP(document.getElementById('cek-hp').value.trim());
-  const resEl = document.getElementById('saldo-result');
-  if (!hp||hp.length<10) { showAlert('alert-cek','error','Masukkan No. HP yang valid.'); resEl.style.display='none'; return; }
-  showAlert('alert-cek','info','⏳ Mencari data...');
-  try {
-    const snap = await getDocs(query(collection(db,'peserta'), where('hp','==',hp)));
-    const aktivDocs = snap.docs.filter(d => !d.data().deleted);
-    if (!aktivDocs.length) { showAlert('alert-cek','error','No. HP tidak ditemukan.'); resEl.style.display='none'; return; }
-    document.getElementById('alert-cek').classList.remove('show');
-    const p = {id:aktivDocs[0].id,...aktivDocs[0].data()};
-    const sSnap = await getDocs(query(collection(db,'setoran'), where('pesertaId','==',p.id), orderBy('tglInput','desc')));
-    const all       = sSnap.docs.map(d=>({id:d.id,...d.data()}));
-    const confirmed = all.filter(s=>s.status==='confirmed');
-    const pending   = all.filter(s=>s.status==='pending');
-    const saldo   = confirmed.reduce((a,s)=>a+s.nominal,0);
-    const targetP = p.targetNominal||3500000;
-    const pc      = pct(saldo, targetP);
+async function loadSaldoForParticipant(p){
+  const resEl=document.getElementById('saldo-result');
+  const sSnap=await getDocs(query(collection(db,'setoran'),where('ownerUid','==',auth.currentUser.uid),where('pesertaId','==',p.id)));
+  const all=sSnap.docs.map(d=>({id:d.id,...d.data()})).filter(s=>s.status!=='deleted')
+    .sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
+  const confirmed=all.filter(s=>s.status==='confirmed');
+  const pending=all.filter(s=>s.status==='pending');
+  const saldo=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0);
+  const targetP=p.targetNominal||3500000; const pc=pct(saldo,targetP);
+  document.getElementById('alert-cek').classList.remove('show');
+  document.getElementById('res-nama').textContent=p.nama;
+  document.getElementById('res-hp').textContent='📞 '+p.hp;
+  document.getElementById('res-jenis').textContent=p.jenis+(p.nomorVA?' · VA: '+p.nomorVA:'');
+  document.getElementById('res-saldo').textContent=rp(saldo);
+  document.getElementById('res-pct').textContent=pc+'%';
+  document.getElementById('res-target').textContent='dari target pribadi '+rp(targetP);
+  setTimeout(()=>document.getElementById('res-bar').style.width=pc+'%',100);
+  const pEl=document.getElementById('res-pending');
+  if(pending.length){pEl.textContent=`⏳ ${pending.length} laporan setoran menunggu konfirmasi (${rp(pending.reduce((a,x)=>a+x.nominal,0))})`;pEl.style.display='block';}
+  else pEl.style.display='none';
+  document.getElementById('res-history').innerHTML=!all.length?'<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>':all.map(x=>{
+    const badge=x.status==='confirmed'?'<span class="badge badge-green">✅ Dikonfirmasi</span>':x.status==='rejected'?'<span class="badge badge-red">❌ Ditolak</span>':'<span class="badge badge-yellow">⏳ Menunggu verifikasi</span>';
+    return `<div class="history-item"><div><div style="font-weight:600;font-size:13px">Transfer VA BSI ${badge}</div><div class="h-tgl">${tglFull(x.tglInput)}</div>
+      ${x.catatan?`<div class="h-tgl">📝 ${esc(x.catatan)}</div>`:''}${x.alasanTolak?`<div class="h-tgl" style="color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>
+      <div class="h-nom">+${rp(x.nominal)}</div></div>`;
+  }).join('');
+  resEl.style.display='block';
+}
 
-    document.getElementById('res-nama').textContent   = p.nama;
-    document.getElementById('res-hp').textContent     = '📞 '+p.hp;
-    document.getElementById('res-jenis').textContent  = p.jenis+(p.nomorVA?' · VA: '+p.nomorVA:'');
-    document.getElementById('res-saldo').textContent  = rp(saldo);
-    document.getElementById('res-pct').textContent    = pc+'%';
-    document.getElementById('res-target').textContent = 'dari target pribadi '+rp(targetP);
-    setTimeout(() => document.getElementById('res-bar').style.width=pc+'%', 100);
-
-    const pEl = document.getElementById('res-pending');
-    if (pending.length) {
-      pEl.textContent = `⏳ ${pending.length} setoran menunggu konfirmasi (${rp(pending.reduce((a,s)=>a+s.nominal,0))})`;
-      pEl.style.display = 'block';
-    } else pEl.style.display='none';
-
-    document.getElementById('res-history').innerHTML = !all.length
-      ? '<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'
-      : all.map(s => {
-          const badge = s.status==='confirmed' ? '<span class="badge badge-green">✅ Dikonfirmasi</span>'
-            : s.status==='rejected' ? '<span class="badge badge-red">❌ Ditolak</span>'
-            : '<span class="badge badge-yellow">⏳ Menunggu</span>';
-          return `<div class="history-item">
-            <div>
-              <div style="font-weight:600;font-size:13px">Transfer VA BSI ${badge}</div>
-              <div class="h-tgl">${tglFull(s.tglInput)}</div>
-              ${s.catatan?`<div class="h-tgl">📝 ${s.catatan}</div>`:''}
-              ${s.alasanTolak?`<div class="h-tgl" style="color:#c62828">❌ ${s.alasanTolak}</div>`:''}
-            </div>
-            <div class="h-nom">+${rp(s.nominal)}</div>
-          </div>`;
-        }).join('');
-    resEl.style.display = 'block';
-  } catch(e) { showAlert('alert-cek','error','Gagal: '+e.message); }
+window.cekSaldo=async function(){
+  const hp=document.getElementById('cek-hp').value.trim();
+  const pin=document.getElementById('cek-pin').value.trim();
+  const resEl=document.getElementById('saldo-result');
+  if(!currentParticipant) showAlert('alert-cek','info','⏳ Memverifikasi akun...');
+  try{
+    const p=await participantForAction(hp,pin);
+    await loadSaldoForParticipant(p);
+  }catch(e){showAlert('alert-cek','error',authMessage(e));resEl.style.display='none';}
 };
 
 // ============================================================
-// ADMIN
+// ADMIN AUTHENTICATION — Firebase Email/Password + role Firestore
 // ============================================================
-window.adminLogin = function() {
-  const user = document.getElementById('admin-user').value.trim();
-  const pass = document.getElementById('admin-pass').value;
-  const adm  = ADMIN_USERS[user];
-  if (adm && adm.pass===pass) {
-    currentAdmin = {user, nama:adm.nama, role:adm.role};
+window.adminLogin=async function(){
+  const email=document.getElementById('admin-user').value.trim().toLowerCase();
+  const pass=document.getElementById('admin-pass').value;
+  if(!email||!pass) return showAlert('alert-admin','error','Email dan password wajib diisi.');
+  try{
+    if(auth.currentUser) await signOut(auth);
+    await setPersistence(auth,browserLocalPersistence);
+    const cred=await signInWithEmailAndPassword(auth,email,pass);
+    const uSnap=await getDoc(doc(db,'users',cred.user.uid));
+    if(!uSnap.exists()) throw new Error('Profil akses admin belum dibuat di collection users.');
+    const u=uSnap.data();
+    if(!['admin','superadmin'].includes(u.role)||u.active!==true) throw new Error('Akun tidak memiliki akses admin aktif.');
+    currentAdmin={uid:cred.user.uid,email,nama:u.nama||email,role:u.role};
+    currentParticipant=null;
     document.getElementById('admin-login-wrap').style.display='none';
     document.getElementById('admin-panel').style.display='block';
-    document.getElementById('adm-welcome').textContent = adm.nama+' · '+(adm.role==='superadmin'?'Super Admin':'Petugas');
-    renderAdminPanel();
-  } else showAlert('alert-admin','error','Username atau password salah.');
+    document.getElementById('nav-admin-btn').style.display='flex';
+    document.getElementById('adm-welcome').textContent=currentAdmin.nama+' · '+(u.role==='superadmin'?'Super Admin':'Admin');
+    await writeAudit('ADMIN_LOGIN','user',cred.user.uid,{});
+    await renderAdminPanel();
+  }catch(e){await signOut(auth).catch(()=>{});currentAdmin=null;showAlert('alert-admin','error',authMessage(e));}
 };
-window.adminLogout = function() {
-  currentAdmin = null;
+window.adminLogout=async function(){
+  if(currentAdmin) await writeAudit('ADMIN_LOGOUT','user',currentAdmin.uid,{});
+  await signOut(auth).catch(()=>{});
+  currentAdmin=null;
   document.getElementById('admin-login-wrap').style.display='block';
   document.getElementById('admin-panel').style.display='none';
   document.getElementById('admin-pass').value='';
   document.getElementById('nav-admin-btn').style.display='none';
   showPage('dashboard');
 };
+window.kirimResetAdmin=async function(){
+  const email=document.getElementById('admin-user').value.trim().toLowerCase();
+  if(!email) return showAlert('alert-admin','error','Isi email admin terlebih dahulu.');
+  try{await sendPasswordResetEmail(auth,email);showAlert('alert-admin','success','✅ Link reset password dikirim ke email admin.');}
+  catch(e){showAlert('alert-admin','error',authMessage(e));}
+};
 
 let allPeserta=[], allSetoran=[];
 let adminFilter='all', adminSort='nama', adminView='list', detailId=null;
 
 async function renderAdminPanel() {
+  if(!currentAdmin) return;
   try {
-    const [pSnap, sSnap] = await Promise.all([
-      getDocs(collection(db,'peserta')),
-      getDocs(collection(db,'setoran'))
-    ]);
-    allPeserta = pSnap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);
-    allSetoran = sSnap.docs.map(d=>({id:d.id,...d.data()}));
-    const pending   = allSetoran.filter(s=>s.status==='pending');
-    const confirmed = allSetoran.filter(s=>s.status==='confirmed');
-    const belumVA   = allPeserta.filter(p=>!p.nomorVA);
-
-    document.getElementById('adm-peserta').textContent      = allPeserta.length;
-    document.getElementById('adm-total').textContent        = rp(confirmed.reduce((a,s)=>a+s.nominal,0));
-    document.getElementById('adm-pending-stat').textContent = pending.length;
+    const [pSnap,sSnap]=await Promise.all([getDocs(collection(db,'peserta')),getDocs(collection(db,'setoran'))]);
+    allPeserta=pSnap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);
+    allSetoran=sSnap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted');
+    pesertaCache=[...allPeserta];
+    const pending=allSetoran.filter(x=>x.status==='pending');
+    const confirmed=allSetoran.filter(x=>x.status==='confirmed');
+    const belumVA=allPeserta.filter(p=>!p.nomorVA);
+    document.getElementById('adm-peserta').textContent=allPeserta.length;
+    document.getElementById('adm-total').textContent=rp(confirmed.reduce((a,x)=>a+Number(x.nominal||0),0));
+    document.getElementById('adm-pending-stat').textContent=pending.length;
     await updateBadge();
-
-    const warn = document.getElementById('adm-va-warn');
-    if (belumVA.length) { warn.textContent=`⚠️ ${belumVA.length} peserta belum punya No. VA`; warn.style.display='block'; }
-    else warn.style.display='none';
-
-    // load estimasi ke textarea
-    const est = await getSetting('estimasi', DEFAULT_ESTIMASI);
-    document.getElementById('adm-estimasi').value = est;
-
+    const warn=document.getElementById('adm-va-warn');
+    const akunBelum=allPeserta.filter(p=>!p.authUid).length;
+    const msgs=[]; if(belumVA.length) msgs.push(`${belumVA.length} peserta belum punya No. VA`); if(akunBelum) msgs.push(`${akunBelum} peserta lama belum diaktifkan PIN`);
+    if(msgs.length){warn.textContent='⚠️ '+msgs.join(' · ');warn.style.display='block';}else warn.style.display='none';
+    if(currentAdmin.role==='superadmin'){
+      const est=await getSetting('estimasi',DEFAULT_ESTIMASI); document.getElementById('adm-estimasi').value=est;
+    }
+    document.querySelectorAll('.superadmin-only').forEach(el=>el.style.display=currentAdmin.role==='superadmin'?'':'none');
     renderPendingList(pending);
-    if (adminView==='list') renderPesertaList();
-  } catch(e) { console.error(e); }
+    if(adminView==='list') renderPesertaList();
+    await ensureParticipantRegistry();
+    await syncPublicStats(false);
+  } catch(e) { console.error(e); showAlert('alert-adm-panel','error','Gagal memuat panel: '+authMessage(e)); }
 }
-window.renderAdminPanel = renderAdminPanel;
+window.renderAdminPanel=renderAdminPanel;
 
 async function updateBadge() {
-  try {
-    const snap = await getDocs(query(collection(db,'setoran'), where('status','==','pending')));
-    const n = snap.size;
-    const b = document.getElementById('badge-pending');
-    b.textContent = n; b.style.display = n?'inline-block':'none';
-  } catch {}
+  const b=document.getElementById('badge-pending');
+  if(!currentAdmin){b.style.display='none';return;}
+  try{const snap=await getDocs(query(collection(db,'setoran'),where('status','==','pending')));b.textContent=snap.size;b.style.display=snap.size?'inline-block':'none';}
+  catch{b.style.display='none';}
 }
 
 const getSaldoP  = id => allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed').reduce((a,s)=>a+s.nominal,0);
@@ -632,75 +900,41 @@ const getLastP   = id => { const l=allSetoran.filter(s=>s.pesertaId===id&&s.stat
 const hasPendP   = id => allSetoran.some(s=>s.pesertaId===id&&s.status==='pending');
 
 function renderPendingList(pending) {
-  const el = document.getElementById('adm-pending-list');
-  if (!pending.length) { el.innerHTML='<div class="empty-state"><div class="ei">✅</div><p>Tidak ada setoran pending</p></div>'; return; }
-  el.innerHTML = pending.sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0)).map(s=>`
-    <div class="pending-item" id="pi-${s.id}">
-      <div class="pi-header">
-        <div>
-          <div class="pi-nama">${s.nama}</div>
-          <div class="pi-info">📞 ${s.hp} · 🏦 VA: ${s.nomorVA||'-'}</div>
-          <div class="pi-info">${tglFmt(s.tglInput)} · Transfer VA BSI</div>
-          ${s.catatan?`<div class="pi-info">📝 ${s.catatan}</div>`:''}
-        </div>
-        <div class="pi-nom">${rp(s.nominal)}</div>
-      </div>
-
-      <div class="rekon-box">
-        <div class="rekon-title">📝 Rekonsiliasi Bank</div>
-        <input type="text" class="form-input" id="rn-${s.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px">
-        <input type="text" class="form-input" id="rw-${s.id}" placeholder="Waktu masuk (misal: 02/06 14:35)" style="margin-bottom:8px;font-size:12px">
-        <input type="text" class="form-input" id="rt-${s.id}" placeholder="Alasan tolak (isi jika ditolak)" style="margin-bottom:8px;font-size:12px">
-        <div style="display:flex;gap:8px">
-          <button class="btn-confirm" onclick="konfirmasi('${s.id}',true)">✅ Dana Masuk</button>
-          <button class="btn-reject"  onclick="konfirmasi('${s.id}',false)">❌ Tolak</button>
-        </div>
-      </div>
-    </div>`).join('');
+  const el=document.getElementById('adm-pending-list');
+  if(!pending.length){el.innerHTML='<div class="empty-state"><div class="ei">✅</div><p>Tidak ada setoran pending</p></div>';return;}
+  el.innerHTML=pending.sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0)).map(x=>`<div class="pending-item" id="pi-${x.id}">
+    <div class="pi-header"><div><div class="pi-nama">${esc(x.nama)}</div><div class="pi-info">📞 ${esc(x.hp)} · 🏦 VA: ${esc(x.nomorVA||'-')}</div>
+    <div class="pi-info">${tglFmt(x.tglInput)} · Transfer VA BSI</div>${x.catatan?`<div class="pi-info">📝 ${esc(x.catatan)}</div>`:''}</div><div class="pi-nom">${rp(x.nominal)}</div></div>
+    <div class="rekon-box"><div class="rekon-title">📝 Rekonsiliasi Bank</div>
+    <input type="text" class="form-input" id="rn-${x.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px">
+    <input type="text" class="form-input" id="rw-${x.id}" placeholder="Waktu masuk (misal: 02/06 14:35)" style="margin-bottom:8px;font-size:12px">
+    <input type="text" class="form-input" id="rt-${x.id}" placeholder="Alasan tolak (isi jika ditolak)" style="margin-bottom:8px;font-size:12px">
+    <div style="display:flex;gap:8px"><button class="btn-confirm" onclick="konfirmasi('${x.id}',true)">✅ Dana Masuk</button><button class="btn-reject" onclick="konfirmasi('${x.id}',false)">❌ Tolak</button></div></div></div>`).join('');
 }
 
 function renderPesertaList() {
-  const el = document.getElementById('adm-peserta-list');
-  let list  = [...allPeserta];
-  if (adminFilter==='va-belum')    list=list.filter(p=>!p.nomorVA);
-  else if (adminFilter==='va-ok')  list=list.filter(p=>!!p.nomorVA);
-  else if (adminFilter==='aktif')  list=list.filter(p=>getSaldoP(p.id)>0);
-  else if (adminFilter==='belum')  list=list.filter(p=>getSaldoP(p.id)===0);
-  else if (adminFilter==='khidmah')    list=list.filter(p=>p.jenis?.includes('Khidmah'));
-  else if (adminFilter==='istiqomah')  list=list.filter(p=>p.jenis?.includes('Istiqomah'));
-  if (adminSort==='saldo-desc')    list.sort((a,b)=>getSaldoP(b.id)-getSaldoP(a.id));
-  else if (adminSort==='saldo-asc')    list.sort((a,b)=>getSaldoP(a.id)-getSaldoP(b.id));
-  else if (adminSort==='pct-desc')     list.sort((a,b)=>pct(getSaldoP(b.id),b.targetNominal||3500000)-pct(getSaldoP(a.id),a.targetNominal||3500000));
-  else if (adminSort==='nama')         list.sort((a,b)=>a.nama.localeCompare(b.nama));
-  else if (adminSort==='terbaru')      list.sort((a,b)=>(b.tglDaftar?.seconds||0)-(a.tglDaftar?.seconds||0));
-  if (!list.length) { el.innerHTML='<div class="empty-state"><div class="ei">🔍</div><p>Tidak ada peserta dengan filter ini</p></div>'; return; }
-  el.innerHTML = list.map(p => {
-    const saldo=getSaldoP(p.id), targetP=p.targetNominal||3500000, pc2=pct(saldo,targetP);
-    const jml=getJmlP(p.id), last=getLastP(p.id), pend=hasPendP(p.id);
-    const vaBadge = p.nomorVA
-      ? `<span class="badge badge-green">🏦 ${p.nomorVA}</span>`
-      : `<span class="badge badge-red">⚠️ Belum VA</span>`;
-    return `<div class="peserta-card" onclick="showDetail('${p.id}')">
-      <div class="pc-top">
-        <div class="avatar">${p.nama.charAt(0).toUpperCase()}</div>
-        <div style="flex:1;min-width:0">
-          <div class="p-nama">${p.nama} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div>
-          <div class="p-sub">📞 ${p.hp}</div>
-          <div class="p-sub">🎯 Target: ${rp(targetP)}</div>
-          <div style="margin-top:3px">${vaBadge}</div>
-        </div>
-        <div style="text-align:right;flex-shrink:0">
-          <div class="p-saldo">${rp(saldo)}</div>
-          <div class="p-pct">${pc2}%</div>
-        </div>
-      </div>
-      <div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div>
-      <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa">
-        <span>${jml}x setor</span>
-        <span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span>
-      </div>
-      <div style="text-align:right;margin-top:5px;font-size:11px;color:var(--emas)">Tap untuk detail →</div>
-    </div>`;
+  const el=document.getElementById('adm-peserta-list'); let list=[...allPeserta];
+  if(adminFilter==='va-belum') list=list.filter(p=>!p.nomorVA);
+  else if(adminFilter==='va-ok') list=list.filter(p=>!!p.nomorVA);
+  else if(adminFilter==='aktif') list=list.filter(p=>getSaldoP(p.id)>0);
+  else if(adminFilter==='belum') list=list.filter(p=>getSaldoP(p.id)===0);
+  else if(adminFilter==='akun-belum') list=list.filter(p=>!p.authUid);
+  if(adminSort==='saldo-desc') list.sort((a,b)=>getSaldoP(b.id)-getSaldoP(a.id));
+  else if(adminSort==='saldo-asc') list.sort((a,b)=>getSaldoP(a.id)-getSaldoP(b.id));
+  else if(adminSort==='pct-desc') list.sort((a,b)=>pct(getSaldoP(b.id),b.targetNominal||3500000)-pct(getSaldoP(a.id),a.targetNominal||3500000));
+  else if(adminSort==='nama') list.sort((a,b)=>a.nama.localeCompare(b.nama));
+  else if(adminSort==='terbaru') list.sort((a,b)=>(b.tglDaftar?.seconds||0)-(a.tglDaftar?.seconds||0));
+  if(!list.length){el.innerHTML='<div class="empty-state"><div class="ei">🔍</div><p>Tidak ada peserta dengan filter ini</p></div>';return;}
+  el.innerHTML=list.map(p=>{
+    const saldo=getSaldoP(p.id),targetP=p.targetNominal||3500000,pc2=pct(saldo,targetP),jml=getJmlP(p.id),last=getLastP(p.id),pend=hasPendP(p.id);
+    const vaBadge=p.nomorVA?`<span class="badge badge-green">🏦 ${esc(p.nomorVA)}</span>`:'<span class="badge badge-red">⚠️ Belum VA</span>';
+    const authBadge=p.authUid?'<span class="badge badge-green">🔐 PIN aktif</span>':'<span class="badge badge-yellow">🔓 Belum PIN</span>';
+    return `<div class="peserta-card" onclick="showDetail('${p.id}')"><div class="pc-top"><div class="avatar">${esc(p.nama.charAt(0).toUpperCase())}</div>
+      <div style="flex:1;min-width:0"><div class="p-nama">${esc(p.nama)} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div><div class="p-sub">📞 ${esc(p.hp)}</div>
+      <div class="p-sub">🎯 Target: ${rp(targetP)}</div><div style="margin-top:3px">${vaBadge} ${authBadge}</div></div>
+      <div style="text-align:right;flex-shrink:0"><div class="p-saldo">${rp(saldo)}</div><div class="p-pct">${pc2}%</div></div></div>
+      <div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa"><span>${jml}x setor</span><span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span></div>
+      <div style="text-align:right;margin-top:5px;font-size:11px;color:var(--emas)">Tap untuk detail →</div></div>`;
   }).join('');
 }
 
@@ -720,159 +954,119 @@ window.backToList = function() {
 };
 
 function renderDetail() {
-  const p = allPeserta.find(x=>x.id===detailId);
-  if (!p) return;
-  const setoranP  = allSetoran.filter(s=>s.pesertaId===p.id).sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
-  const confirmed = setoranP.filter(s=>s.status==='confirmed');
-  const pending   = setoranP.filter(s=>s.status==='pending');
-  const saldo   = confirmed.reduce((a,s)=>a+s.nominal,0);
-  const targetP = p.targetNominal||3500000;
-  const pc      = pct(saldo, targetP);
-  document.getElementById('detail-content').innerHTML = `
-    <div class="saldo-card" style="margin-bottom:12px">
-      <div class="s-nama">${p.nama}</div>
-      <div class="s-hp">📞 ${p.hp}</div>
-      <div class="s-jenis">${p.jenis}</div>
-      <span class="s-angka">${rp(saldo)}</span>
-      <div class="s-label">Saldo Dikonfirmasi · ${confirmed.length}x setor</div>
-      <div class="s-progress"><div class="s-pfill" style="width:${pc}%"></div></div>
-      <div class="s-pct">${pc}%</div>
-      <div class="s-target">dari target pribadi ${rp(targetP)}</div>
-    </div>
-
-    <div class="card" style="border:${p.nomorVA?'1px solid rgba(201,168,76,.2)':'2px solid #e53935'}">
-      <div class="card-title">🏦 Virtual Account BSI</div>
-      ${p.nomorVA
-        ? `<div class="va-assigned"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI</div>
-           <div class="va-assigned-num">${p.nomorVA}</div></div>
-           <div style="display:flex;gap:8px;margin-top:8px">
-             <input type="text" class="form-input" id="va-inp-${p.id}" value="${p.nomorVA}" style="font-size:13px">
-             <button class="btn btn-outline btn-sm" onclick="simpanVA('${p.id}')">Ubah</button>
-           </div>`
-        : `<div style="background:#fde8e8;border-radius:10px;padding:12px;margin-bottom:12px;font-size:12px;color:#c62828">⚠️ Belum ada No. VA. Input sekarang.</div>
-           <div class="form-group"><label class="form-label">Input No. VA BSI</label>
-           <input type="text" class="form-input" id="va-inp-${p.id}" placeholder="Contoh: 8809012345678"></div>
-           <button class="btn btn-primary" onclick="simpanVA('${p.id}')">💾 Simpan No. VA</button>`}
-    </div>
-
-    <div class="card">
-      <div class="card-title">🎯 Ubah Target Nominal</div>
-      <div style="display:flex;gap:8px">
-        <div style="flex:1;position:relative">
-          <span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--hijau);font-weight:700">Rp</span>
-          <input type="number" class="form-input" id="target-inp-${p.id}" value="${targetP}" style="padding-left:36px;font-size:13px">
-        </div>
-        <button class="btn btn-outline btn-sm" onclick="simpanTargetPeserta('${p.id}')">Simpan</button>
-      </div>
-    </div>
-
-    ${pending.length?`<div class="pending-notice" style="display:block;margin-bottom:12px">⏳ ${pending.length} setoran pending (${rp(pending.reduce((a,s)=>a+s.nominal,0))})</div>`:''}
-
-    <div class="card">
-      <div class="card-title">📋 Riwayat Setoran</div>
-      ${setoranP.length ? setoranP.map(s => {
-        const badge = s.status==='confirmed'?'<span class="badge badge-green">✅</span>'
-          :s.status==='rejected'?'<span class="badge badge-red">❌</span>'
-          :'<span class="badge badge-yellow">⏳</span>';
-        return `<div class="s-detail-item">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-            <div>
-              <div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(s.nominal)} ${badge}</div>
-              <div style="font-size:11px;color:#888">${tglFull(s.tglInput)} · Transfer VA BSI</div>
-              ${s.catatan?`<div style="font-size:11px;color:#888">📝 ${s.catatan}</div>`:''}
-              ${s.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${s.rekonNama} · ${s.rekonWaktu||''}</div>`:''}
-              ${s.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${s.alasanTolak}</div>`:''}
-            </div>
-
-          </div>
-          ${s.status==='pending'?`<div class="rekon-box" style="margin-top:8px">
-            <input type="text" class="form-input" id="rn-${s.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px">
-            <input type="text" class="form-input" id="rw-${s.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px">
-            <input type="text" class="form-input" id="rt-${s.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px">
-            <div style="display:flex;gap:8px">
-              <button class="btn-confirm" onclick="konfirmasi('${s.id}',true)">✅ Dana Masuk</button>
-              <button class="btn-reject" onclick="konfirmasi('${s.id}',false)">❌ Tolak</button>
-            </div>
-          </div>`:''}
-        </div>`;
-      }).join('') : '<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}
-    </div>
+  const p=allPeserta.find(x=>x.id===detailId); if(!p)return;
+  const setoranP=allSetoran.filter(x=>x.pesertaId===p.id).sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
+  const confirmed=setoranP.filter(x=>x.status==='confirmed'),pending=setoranP.filter(x=>x.status==='pending');
+  const saldo=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0),targetP=p.targetNominal||3500000,pc=pct(saldo,targetP);
+  document.getElementById('detail-content').innerHTML=`
+    <div class="saldo-card" style="margin-bottom:12px"><div class="s-nama">${esc(p.nama)}</div><div class="s-hp">📞 ${esc(p.hp)}</div><div class="s-jenis">${esc(p.jenis)}</div>
+      <span class="s-angka">${rp(saldo)}</span><div class="s-label">Saldo Dikonfirmasi · ${confirmed.length}x setor</div><div class="s-progress"><div class="s-pfill" style="width:${pc}%"></div></div><div class="s-pct">${pc}%</div><div class="s-target">dari target pribadi ${rp(targetP)}</div></div>
+    <div class="card" style="border:2px solid ${p.authUid?'#4caf50':'#ff9800'}"><div class="card-title">🔐 Akses Aman Peserta</div>
+      <div style="font-size:12px;margin-bottom:10px;color:${p.authUid?'#2e7d32':'#e65100'}">${p.authUid?'✅ Akun PIN aktif. Tombol di bawah akan mereset PIN dan menonaktifkan akun lama.':'⚠️ Peserta lama belum memiliki akun Firebase Authentication.'}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="pin-inp-${p.id}" placeholder="PIN baru 6 digit"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="pin2-inp-${p.id}" placeholder="Ulangi PIN"></div>
+      <button class="btn btn-primary" onclick="aktifkanPinPeserta('${p.id}')" style="margin-top:8px">${p.authUid?'🔄 Reset PIN Peserta':'🔐 Aktifkan PIN Peserta'}</button>
+      <div style="font-size:10px;color:#888;margin-top:6px">PIN tidak disimpan di Firestore. Sampaikan PIN kepada peserta melalui jalur pribadi.</div></div>
+    <div class="card" style="border:${p.nomorVA?'1px solid rgba(201,168,76,.2)':'2px solid #e53935'}"><div class="card-title">🏦 Virtual Account BSI</div>
+      ${p.nomorVA?`<div class="va-assigned"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI</div><div class="va-assigned-num">${esc(p.nomorVA)}</div></div><div style="display:flex;gap:8px;margin-top:8px"><input type="text" class="form-input" id="va-inp-${p.id}" value="${esc(p.nomorVA)}" style="font-size:13px"><button class="btn btn-outline btn-sm" onclick="simpanVA('${p.id}')">Ubah</button></div>`:
+      `<div style="background:#fde8e8;border-radius:10px;padding:12px;margin-bottom:12px;font-size:12px;color:#c62828">⚠️ Belum ada No. VA. Input sekarang.</div><div class="form-group"><label class="form-label">Input No. VA BSI</label><input type="text" class="form-input" id="va-inp-${p.id}" placeholder="Contoh: 8809012345678"></div><button class="btn btn-primary" onclick="simpanVA('${p.id}')">💾 Simpan No. VA</button>`}</div>
+    <div class="card"><div class="card-title">🎯 Ubah Target Nominal</div><div style="display:flex;gap:8px"><div style="flex:1;position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--hijau);font-weight:700">Rp</span><input type="number" class="form-input" id="target-inp-${p.id}" value="${targetP}" style="padding-left:36px;font-size:13px"></div><button class="btn btn-outline btn-sm" onclick="simpanTargetPeserta('${p.id}')">Simpan</button></div></div>
+    ${pending.length?`<div class="pending-notice" style="display:block;margin-bottom:12px">⏳ ${pending.length} setoran pending (${rp(pending.reduce((a,x)=>a+x.nominal,0))})</div>`:''}
+    <div class="card"><div class="card-title">📋 Riwayat Setoran</div>${setoranP.length?setoranP.map(x=>{const badge=x.status==='confirmed'?'<span class="badge badge-green">✅</span>':x.status==='rejected'?'<span class="badge badge-red">❌</span>':'<span class="badge badge-yellow">⏳</span>';return `<div class="s-detail-item"><div><div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(x.nominal)} ${badge}</div><div style="font-size:11px;color:#888">${tglFull(x.tglInput)} · Transfer VA BSI</div>${x.catatan?`<div style="font-size:11px;color:#888">📝 ${esc(x.catatan)}</div>`:''}${x.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${esc(x.rekonNama)} · ${esc(x.rekonWaktu||'')}</div>`:''}${x.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>${x.status==='pending'?`<div class="rekon-box" style="margin-top:8px"><input type="text" class="form-input" id="rn-${x.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rw-${x.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rt-${x.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px"><div style="display:flex;gap:8px"><button class="btn-confirm" onclick="konfirmasi('${x.id}',true)">✅ Dana Masuk</button><button class="btn-reject" onclick="konfirmasi('${x.id}',false)">❌ Tolak</button></div></div>`:''}</div>`}).join(''):'<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}</div>
     <button class="btn btn-outline" onclick="exportPesertaCSV('${p.id}')" style="margin-bottom:10px">📤 Export CSV Peserta Ini</button>
-    ${currentAdmin?.role==='superadmin' ? `
-    <div style="border-top:2px dashed #fde8e8;padding-top:14px;margin-top:4px">
-      <button class="btn" onclick="hapusPeserta('${p.id}','${p.nama}')" style="background:#fde8e8;color:#c62828;border:1.5px solid #ef9a9a;width:100%;font-weight:700">🗑️ Hapus Peserta Ini</button>
-      <div style="font-size:10px;color:#e57373;margin-top:5px;text-align:center">⚠️ Hanya Super Admin · Tindakan ini tidak dapat dibatalkan</div>
-    </div>` : ''}`;
+    ${currentAdmin?.role==='superadmin'?`<div style="border-top:2px dashed #fde8e8;padding-top:14px;margin-top:4px"><button class="btn" onclick="hapusPeserta('${p.id}')" style="background:#fde8e8;color:#c62828;border:1.5px solid #ef9a9a;width:100%;font-weight:700">🗑️ Hapus Peserta Ini</button><div style="font-size:10px;color:#e57373;margin-top:5px;text-align:center">⚠️ Hanya Super Admin · soft delete dan akses login dinonaktifkan</div></div>`:''}`;
 }
 
-window.hapusPeserta = async function(pid, nama) {
-  if (currentAdmin?.role !== 'superadmin') return alert('Hanya Super Admin yang bisa menghapus peserta.');
-  if (!confirm(`⚠️ Yakin hapus peserta "${nama}"?\n\nSemua data setoran peserta ini juga akan dihapus.\nTindakan ini TIDAK BISA dibatalkan.`)) return;
-  try {
-    // Hapus semua setoran peserta (soft delete)
-    const sSnap = await getDocs(query(collection(db,'setoran'), where('pesertaId','==',pid)));
-    for (const s of sSnap.docs) await updateDoc(doc(db,'setoran',s.id), {status:'deleted'});
-    // Hapus peserta (soft delete)
-    await updateDoc(doc(db,'peserta',pid), {deleted:true, deletedAt:serverTimestamp(), deletedBy:currentAdmin.nama});
-    showAlert('alert-adm-panel','success','✅ Peserta berhasil dihapus.');
-    // Refresh semua data
-    await loadPesertaCache();
-    allPeserta = allPeserta.filter(p => p.id !== pid);
-    allSetoran = allSetoran.filter(s => s.pesertaId !== pid);
-    backToList();
-    renderAdminPanel();
-  } catch(e) { alert('Gagal menghapus: '+e.message); }
+window.hapusPeserta=async function(pid){
+  if(currentAdmin?.role!=='superadmin') return alert('Hanya Super Admin yang bisa menghapus peserta.');
+  const p=allPeserta.find(x=>x.id===pid); if(!p)return;
+  if(!confirm(`⚠️ Yakin soft delete peserta "${p.nama}"?\n\nAkun login akan dinonaktifkan dan data tetap tersimpan untuk audit.`))return;
+  try{
+    const main=writeBatch(db);
+    main.update(doc(db,'peserta',pid),{deleted:true,deletedAt:serverTimestamp(),deletedBy:currentAdmin.nama,statusAkun:'disabled'});
+    if(p.authUid) main.set(doc(db,'users',p.authUid),{active:false,disabledAt:serverTimestamp(),disabledBy:currentAdmin.uid},{merge:true});
+    main.set(doc(db,'login_lookup',p.hp),{active:false,deleted:true,updatedAt:serverTimestamp()},{merge:true});
+    await main.commit();
+    const rows=allSetoran.filter(x=>x.pesertaId===pid);
+    for(let i=0;i<rows.length;i+=400){const batch=writeBatch(db);rows.slice(i,i+400).forEach(x=>batch.update(doc(db,'setoran',x.id),{status:'deleted',deletedAt:serverTimestamp()}));await batch.commit();}
+    await writeAudit('DELETE_PARTICIPANT','peserta',pid,{nama:p.nama});
+    backToList(); await renderAdminPanel();
+    showAlert('alert-adm-panel','success','✅ Peserta dinonaktifkan dan dicatat di audit log.');
+  }catch(e){alert('Gagal menghapus: '+authMessage(e));}
 };
 
-window.simpanVA = async function(pid) {
-  const va = document.getElementById('va-inp-'+pid)?.value.trim();
-  if (!va) return alert('Nomor VA tidak boleh kosong.');
-  try {
-    await updateDoc(doc(db,'peserta',pid), { nomorVA:va, assignOleh:currentAdmin?.nama||'Admin', tglVA:serverTimestamp() });
-    showAlert('alert-adm-panel','success','✅ No. VA berhasil disimpan.');
-    await renderAdminPanel();
-    await loadPesertaCache();
-    if (adminView==='detail') renderDetail();
-  } catch(e) { alert('Gagal: '+e.message); }
+window.simpanVA=async function(pid){
+  const va=document.getElementById('va-inp-'+pid)?.value.trim(); if(!va)return alert('Nomor VA tidak boleh kosong.');
+  try{await updateDoc(doc(db,'peserta',pid),{nomorVA:va,assignOleh:currentAdmin.nama,tglVA:serverTimestamp()});await writeAudit('UPDATE_VA','peserta',pid,{nomorVA:va});await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel','success','✅ No. VA berhasil disimpan.');}
+  catch(e){alert('Gagal: '+authMessage(e));}
 };
 
-window.simpanTargetPeserta = async function(pid) {
-  const v = parseInt(document.getElementById('target-inp-'+pid)?.value);
-  if (!v||v<100000) return alert('Target minimal Rp 100.000.');
-  try {
-    await updateDoc(doc(db,'peserta',pid), { targetNominal:v });
-    showAlert('alert-adm-panel','success','✅ Target peserta diperbarui: '+rp(v));
-    await renderAdminPanel();
-    if (adminView==='detail') renderDetail();
-  } catch(e) { alert('Gagal: '+e.message); }
+window.simpanTargetPeserta=async function(pid){
+  const v=parseInt(document.getElementById('target-inp-'+pid)?.value);if(!v||v<100000)return alert('Target minimal Rp 100.000.');
+  try{await updateDoc(doc(db,'peserta',pid),{targetNominal:v});await writeAudit('UPDATE_TARGET','peserta',pid,{targetNominal:v});await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel','success','✅ Target peserta diperbarui: '+rp(v));}
+  catch(e){alert('Gagal: '+authMessage(e));}
 };
 
-window.konfirmasi = async function(sid, approve) {
-  const alasan    = document.getElementById('rt-'+sid)?.value.trim();
-  const rekonNama = document.getElementById('rn-'+sid)?.value.trim();
-  const rekonWaktu= document.getElementById('rw-'+sid)?.value.trim();
-  if (!approve && !alasan && !confirm('Tolak tanpa alasan?')) return;
-  try {
-    await updateDoc(doc(db,'setoran',sid), {
-      status: approve ? 'confirmed' : 'rejected',
-      tglKonfirmasi: serverTimestamp(),
-      konfirmasiOleh: currentAdmin?.nama||'Admin',
-      ...(alasan    && {alasanTolak:alasan}),
-      ...(rekonNama && {rekonNama}),
-      ...(rekonWaktu&& {rekonWaktu}),
-    });
-    document.getElementById('pi-'+sid)?.remove();
-    showAlert('alert-adm-panel', approve?'success':'error', approve?'✅ Setoran dikonfirmasi!':'❌ Setoran ditolak.');
-    await renderAdminPanel();
-    if (adminView==='detail') renderDetail();
-  } catch(e) { showAlert('alert-adm-panel','error','Gagal: '+e.message); }
+window.konfirmasi=async function(sid,approve){
+  const alasan=document.getElementById('rt-'+sid)?.value.trim(),rekonNama=document.getElementById('rn-'+sid)?.value.trim(),rekonWaktu=document.getElementById('rw-'+sid)?.value.trim();
+  if(!approve&&!alasan&&!confirm('Tolak tanpa alasan?'))return;
+  const srow=allSetoran.find(x=>x.id===sid); const p=allPeserta.find(x=>x.id===srow?.pesertaId);
+  try{await updateDoc(doc(db,'setoran',sid),{status:approve?'confirmed':'rejected',tglKonfirmasi:serverTimestamp(),konfirmasiOleh:currentAdmin.nama,
+    ...(p?.authUid?{ownerUid:p.authUid}:{}),...(alasan&&{alasanTolak:alasan}),...(rekonNama&&{rekonNama}),...(rekonWaktu&&{rekonWaktu})});
+    await writeAudit(approve?'CONFIRM_SETORAN':'REJECT_SETORAN','setoran',sid,{nominal:srow?.nominal||0,pesertaId:srow?.pesertaId||'',alasan:alasan||''});
+    await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel',approve?'success':'error',approve?'✅ Setoran dikonfirmasi!':'❌ Setoran ditolak.');}
+  catch(e){showAlert('alert-adm-panel','error','Gagal: '+authMessage(e));}
 };
 
-window.simpanEstimasi = async function() {
-  const v = document.getElementById('adm-estimasi').value.trim();
-  if (!v) return;
-  await setSetting('estimasi', v);
-  showAlert('alert-adm-panel','success','✅ Info estimasi harga diperbarui.');
+window.aktifkanPinPeserta=async function(pid){
+  const p=allPeserta.find(x=>x.id===pid);if(!p)return;
+  const pin=document.getElementById('pin-inp-'+pid)?.value.trim(),pin2=document.getElementById('pin2-inp-'+pid)?.value.trim();
+  if(!pinValid(pin))return alert('PIN harus 6 digit dan tidak boleh terlalu mudah.');
+  if(pin!==pin2)return alert('Konfirmasi PIN tidak sama.');
+  try{
+    await signOut(helperAuth).catch(()=>{});
+    const loginEmail=participantAliasEmail(p.hp);
+    const cred=await createUserWithEmailAndPassword(helperAuth,loginEmail,pin); const newUid=cred.user.uid;
+    const batch=writeBatch(db);
+    batch.set(doc(db,'users',newUid),{nama:p.nama,hp:p.hp,role:'participant',active:true,participantId:p.id,loginEmail,createdAt:serverTimestamp(),createdBy:currentAdmin.uid});
+    batch.update(doc(db,'peserta',p.id),{authUid:newUid,statusAkun:'active',pinUpdatedAt:serverTimestamp(),pinUpdatedBy:currentAdmin.uid});
+    batch.set(doc(db,'login_lookup',p.hp),{hp:p.hp,uid:newUid,participantId:p.id,loginEmail,active:true,registered:true,updatedAt:serverTimestamp()},{merge:true});
+    if(p.authUid)batch.set(doc(db,'users',p.authUid),{active:false,replacedBy:newUid,disabledAt:serverTimestamp()},{merge:true});
+    await batch.commit();
+    const rows=allSetoran.filter(x=>x.pesertaId===p.id);
+    for(let i=0;i<rows.length;i+=400){const b=writeBatch(db);rows.slice(i,i+400).forEach(x=>b.update(doc(db,'setoran',x.id),{ownerUid:newUid}));await b.commit();}
+    await signOut(helperAuth);
+    await writeAudit(p.authUid?'RESET_PARTICIPANT_PIN':'ACTIVATE_PARTICIPANT_PIN','peserta',p.id,{newUid,migratedSetoran:rows.length});
+    alert('✅ PIN peserta berhasil '+(p.authUid?'direset':'diaktifkan')+'. Sampaikan PIN melalui jalur pribadi.');
+    await renderAdminPanel();if(adminView==='detail')renderDetail();
+  }catch(e){await signOut(helperAuth).catch(()=>{});alert('Gagal mengaktifkan PIN: '+authMessage(e));}
+};
+
+async function ensureParticipantRegistry(){
+  if(!currentAdmin||!allPeserta.length)return;
+  for(let i=0;i<allPeserta.length;i+=350){
+    const batch=writeBatch(db);
+    allPeserta.slice(i,i+350).forEach(p=>{if(p.hp)batch.set(doc(db,'login_lookup',p.hp),{hp:p.hp,participantId:p.id,registered:true,updatedAt:serverTimestamp()},{merge:true});});
+    await batch.commit();
+  }
+}
+
+async function syncPublicStats(logAction=true){
+  if(!currentAdmin)return;
+  const confirmed=allSetoran.filter(x=>x.status==='confirmed');
+  const totalDana=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0);
+  const totalTarget=allPeserta.reduce((a,p)=>a+Number(p.targetNominal||0),0);
+  const items=allPeserta.map(p=>{const saldo=confirmed.filter(x=>x.pesertaId===p.id).reduce((a,x)=>a+Number(x.nominal||0),0);return{namaMasked:maskName(p.nama),jenis:p.jenis||'',saldo,target:p.targetNominal||0,progress:pct(saldo,p.targetNominal||3500000)};}).sort((a,b)=>b.saldo-a.saldo).slice(0,5);
+  const batch=writeBatch(db);
+  batch.set(doc(db,'public_stats','overview'),{totalPeserta:allPeserta.length,totalDana,totalTarget,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
+  batch.set(doc(db,'leaderboard_public','top5'),{items,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
+  await batch.commit();
+  if(logAction)await writeAudit('SYNC_PUBLIC_DASHBOARD','public_stats','overview',{totalPeserta:allPeserta.length,totalDana});
+}
+window.syncPublicDashboard=async function(){try{await syncPublicStats(true);await loadDashboard();showAlert('alert-security','success','✅ Dashboard publik berhasil disinkronkan.');}catch(e){showAlert('alert-security','error',authMessage(e));}};
+
+window.simpanEstimasi=async function(){
+  try{const v=document.getElementById('adm-estimasi').value.trim();if(!v)return;await setSetting('estimasi',v);await writeAudit('UPDATE_SETTING','settings','estimasi',{});showAlert('alert-adm-panel','success','✅ Info estimasi harga diperbarui.');}
+  catch(e){showAlert('alert-adm-panel','error',authMessage(e));}
 };
 
 // ============================================================
@@ -902,16 +1096,9 @@ async function loadKontakEditor() {
   `).join('');
 }
 
-window.simpanKontak = async function() {
-  const saved = await getSetting('kontak_admin', DEFAULT_KONTAK);
-  const list = JSON.parse(saved);
-  const hasil = list.map((_,i) => ({
-    nama: document.getElementById(`kontak-nama-${i}`).value.trim(),
-    hp: document.getElementById(`kontak-hp-${i}`).value.trim().replace(/\D/g,'')
-  })).filter(k => k.nama && k.hp);
-  await setSetting('kontak_admin', JSON.stringify(hasil));
-  await renderKontakDynamic();
-  showAlert('alert-kontak-editor','success','✅ Kontak admin berhasil diperbarui.');
+window.simpanKontak=async function(){
+  try{const saved=await getSetting('kontak_admin',DEFAULT_KONTAK);const list=JSON.parse(saved);const hasil=list.map((_,i)=>({nama:document.getElementById(`kontak-nama-${i}`).value.trim(),hp:document.getElementById(`kontak-hp-${i}`).value.trim().replace(/\D/g,'')})).filter(k=>k.nama&&k.hp);await setSetting('kontak_admin',JSON.stringify(hasil));await writeAudit('UPDATE_SETTING','settings','kontak_admin',{jumlah:hasil.length});await renderKontakDynamic();showAlert('alert-kontak-editor','success','✅ Kontak admin berhasil diperbarui.');}
+  catch(e){showAlert('alert-kontak-editor','error',authMessage(e));}
 };
 
 async function renderKontakDynamic() {
@@ -993,17 +1180,9 @@ async function loadPaketSetting() {
     </div>`).join('');
 }
 
-window.simpanPaketSetting = async function() {
-  const saved = await getSetting('paket_tabungan', JSON.stringify(DEFAULT_PAKET));
-  const paket = JSON.parse(saved);
-  const hasil = paket.map((_,i) => ({
-    icon: document.getElementById(`paket-icon-${i}`)?.value || '🐑',
-    nama: document.getElementById(`paket-nama-${i}`)?.value.trim() || '',
-    harga: parseInt(document.getElementById(`paket-harga-${i}`)?.value) || 0,
-  }));
-  await setSetting('paket_tabungan', JSON.stringify(hasil));
-  showAlert('alert-paket-setting','success','✅ Paket tabungan berhasil diperbarui.');
-  await renderPaketDaftar();
+window.simpanPaketSetting=async function(){
+  try{const saved=await getSetting('paket_tabungan',JSON.stringify(DEFAULT_PAKET));const paket=JSON.parse(saved);const hasil=paket.map((_,i)=>({icon:document.getElementById(`paket-icon-${i}`)?.value||'🐑',nama:document.getElementById(`paket-nama-${i}`)?.value.trim()||'',harga:parseInt(document.getElementById(`paket-harga-${i}`)?.value)||0}));await setSetting('paket_tabungan',JSON.stringify(hasil));await writeAudit('UPDATE_SETTING','settings','paket_tabungan',{jumlah:hasil.length});showAlert('alert-paket-setting','success','✅ Paket tabungan berhasil diperbarui.');await renderPaketDaftar();}
+  catch(e){showAlert('alert-paket-setting','error',authMessage(e));}
 };
 
 async function renderPaketDaftar() {
@@ -1045,11 +1224,9 @@ async function loadSKEditor() {
   document.getElementById('adm-sk').value = sk;
 }
 
-window.simpanSK = async function() {
-  const v = document.getElementById('adm-sk').value.trim();
-  if (!v) return showAlert('alert-sk-editor','error','S&K tidak boleh kosong.');
-  await setSetting('syarat_ketentuan', v);
-  showAlert('alert-sk-editor','success','✅ Syarat & Ketentuan berhasil diperbarui.');
+window.simpanSK=async function(){
+  try{const v=document.getElementById('adm-sk').value.trim();if(!v)return showAlert('alert-sk-editor','error','S&K tidak boleh kosong.');await setSetting('syarat_ketentuan',v);await writeAudit('UPDATE_SETTING','settings','syarat_ketentuan',{});showAlert('alert-sk-editor','success','✅ Syarat & Ketentuan berhasil diperbarui.');}
+  catch(e){showAlert('alert-sk-editor','error',authMessage(e));}
 };
 
 async function renderSKModal() {
@@ -1076,15 +1253,71 @@ async function renderSKModal() {
   modalBody.innerHTML = html;
 }
 
-window.showAdmTab = function(tab, btn) {
+window.showAdmTab=function(tab,btn){
+  if(['setting','security','audit'].includes(tab)&&currentAdmin?.role!=='superadmin')return alert('Menu ini hanya untuk Super Admin.');
   document.querySelectorAll('[id^="adm-tab-"]').forEach(el=>el.style.display='none');
   document.querySelectorAll('.adm-tab-btn').forEach(b=>b.classList.remove('active'));
-  document.getElementById('adm-tab-'+tab).style.display='block';
-  btn.classList.add('active');
-  if (tab==='peserta') renderPesertaList();
-  if (tab==='setting') { loadSKEditor(); loadPaketSetting(); loadKontakEditor(); }
-  if (tab==='rekap') renderRekap();
+  document.getElementById('adm-tab-'+tab).style.display='block';btn.classList.add('active');
+  if(tab==='peserta')renderPesertaList();
+  if(tab==='setting'){loadSKEditor();loadPaketSetting();loadKontakEditor();}
+  if(tab==='rekap')renderRekap();
+  if(tab==='security')renderAdminUsers();
+  if(tab==='audit')renderAuditLog();
 };
+
+window.buatAdminBaru=async function(){
+  if(currentAdmin?.role!=='superadmin')return;
+  const nama=document.getElementById('sec-admin-nama').value.trim();
+  const email=document.getElementById('sec-admin-email').value.trim().toLowerCase();
+  const role=document.getElementById('sec-admin-role').value;
+  if(!nama||!email)return showAlert('alert-security','error','Nama dan email admin wajib diisi.');
+  const tempPassword=temporaryAdminPassword();
+  try{
+    await signOut(helperAuth).catch(()=>{});
+    const cred=await createUserWithEmailAndPassword(helperAuth,email,tempPassword);
+    await setDoc(doc(db,'users',cred.user.uid),{
+      nama,email,role,active:true,invitationPending:true,
+      createdAt:serverTimestamp(),createdBy:currentAdmin.uid
+    });
+    let emailSent=true;
+    try{await sendPasswordResetEmail(helperAuth,email);}catch(mailError){emailSent=false;console.warn('Undangan email gagal:',mailError);}
+    await signOut(helperAuth);
+    await writeAudit('INVITE_ADMIN','user',cred.user.uid,{nama,email,role,emailSent});
+    ['sec-admin-nama','sec-admin-email'].forEach(id=>document.getElementById(id).value='');
+    showAlert('alert-security',emailSent?'success':'info',emailSent
+      ?'✅ Undangan dikirim. Admin membuat password sendiri melalui email.'
+      :'⚠️ Akun admin sudah dibuat, tetapi email belum terkirim. Gunakan tombol “Kirim Ulang Email”.');
+    await renderAdminUsers();
+  }catch(e){
+    await signOut(helperAuth).catch(()=>{});
+    showAlert('alert-security','error',authMessage(e));
+  }
+};
+
+window.kirimUlangUndanganAdmin=async function(email){
+  if(currentAdmin?.role!=='superadmin'||!email)return;
+  try{
+    await sendPasswordResetEmail(helperAuth,email);
+    await writeAudit('RESEND_ADMIN_INVITATION','user','',{email});
+    showAlert('alert-security','success','✅ Email pembuatan/reset password dikirim ulang.');
+  }catch(e){showAlert('alert-security','error',authMessage(e));}
+};
+
+async function renderAdminUsers(){
+  if(currentAdmin?.role!=='superadmin')return;
+  const snap=await getDocs(collection(db,'users'));const rows=snap.docs.map(d=>({uid:d.id,...d.data()})).filter(x=>['admin','superadmin'].includes(x.role));
+  const el=document.getElementById('security-admin-list');
+  el.innerHTML=rows.length?rows.map(x=>`<div class="peserta-card"><div class="pc-top"><div class="avatar">${esc((x.nama||x.email||'?').charAt(0).toUpperCase())}</div><div style="flex:1"><div class="p-nama">${esc(x.nama||'-')}</div><div class="p-sub">${esc(x.email||'-')} · ${esc(x.role)}</div></div><span class="badge ${x.active?'badge-green':'badge-red'}">${x.active?'Aktif':'Nonaktif'}</span></div>${x.uid!==currentAdmin.uid?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button class="btn btn-outline btn-sm" onclick="toggleAdminActive('${x.uid}',${x.active?'false':'true'})">${x.active?'Nonaktifkan':'Aktifkan'}</button><button class="btn btn-outline btn-sm" onclick="kirimUlangUndanganAdmin('${esc(x.email||'')}')">Kirim Ulang Email</button></div>`:'<div style="font-size:10px;color:#888;margin-top:5px">Akun yang sedang digunakan</div>'}</div>`).join(''):'<div class="empty-state"><p>Belum ada admin.</p></div>';
+}
+window.toggleAdminActive=async function(uid,active){if(currentAdmin?.role!=='superadmin'||uid===currentAdmin.uid)return;try{await updateDoc(doc(db,'users',uid),{active,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid});await writeAudit(active?'ENABLE_ADMIN':'DISABLE_ADMIN','user',uid,{});await renderAdminUsers();}catch(e){showAlert('alert-security','error',authMessage(e));}};
+
+async function renderAuditLog(){
+  if(currentAdmin?.role!=='superadmin')return;
+  const snap=await getDocs(query(collection(db,'audit_logs'),orderBy('timestamp','desc'),limit(100)));const rows=snap.docs.map(d=>({id:d.id,...d.data()}));
+  const el=document.getElementById('audit-list');
+  el.innerHTML=rows.length?rows.map(x=>`<div class="history-item" style="align-items:flex-start"><div><div style="font-weight:700;font-size:12px;color:var(--hijau)">${esc(x.action)}</div><div class="h-tgl">${tglFull(x.timestamp)} · ${esc(x.actorName||'-')} (${esc(x.actorRole||'-')})</div><div class="h-tgl">${esc(x.targetType||'')} ${esc(x.targetId||'')}</div><div class="h-tgl" style="word-break:break-word">${esc(JSON.stringify(x.details||{}))}</div></div></div>`).join(''):'<div class="empty-state"><p>Belum ada audit log.</p></div>';
+}
+window.refreshAudit=renderAuditLog;
 
 function renderRekap() {
   const container = document.getElementById('rekap-content');
@@ -1219,12 +1452,37 @@ function dlCSV(csv, fn) {
 // INIT
 loadDashboard();
 renderKontakDynamic();
-document.getElementById('setor-tgl').value = new Date().toISOString().split('T')[0];
-updateBadge();
+document.getElementById('setor-tgl').value=new Date().toISOString().split('T')[0];
+
+onAuthStateChanged(auth,async user=>{
+  currentAdmin=null;currentParticipant=null;
+  if(!user){setParticipantLoginVisibility(false);return;}
+  try{
+    const uSnap=await getDoc(doc(db,'users',user.uid));
+    if(!uSnap.exists()){await signOut(auth);return;}
+    const u=uSnap.data();
+    if(u.active!==true){await signOut(auth);return;}
+    if(['admin','superadmin'].includes(u.role)){
+      currentAdmin={uid:user.uid,email:user.email||u.email||'',nama:u.nama||user.email,role:u.role};
+      document.getElementById('nav-admin-btn').style.display='flex';
+      document.getElementById('admin-login-wrap').style.display='none';
+      document.getElementById('admin-panel').style.display='block';
+      document.getElementById('adm-welcome').textContent=currentAdmin.nama+' · '+(u.role==='superadmin'?'Super Admin':'Admin');
+      updateBadge();
+    }else if(u.role==='participant'){
+      currentParticipant=await getCurrentParticipant();fillParticipantFields();startParticipantIdleTimer();
+      const activeId=document.querySelector('.page.active')?.id;
+      if(activeId==='page-va')renderVAResult(currentParticipant);
+      if(activeId==='page-setor')renderSetorParticipant(currentParticipant);
+      if(activeId==='page-cek')await loadSaldoForParticipant(currentParticipant);
+    }
+  }catch(e){console.warn(e);}
+});
 </script>
 
 <style>
-:root{--hijau:#1a4a2e;--hijau-mid:#2d6a44;--hijau-light:#3d8a5a;--emas:#c9a84c;--emas-light:#e8c97a;--emas-pale:#f5e6b8;--krem:#faf6ed;--krem-dark:#f0e8d0;--teks:#1a1a1a;--putih:#ffffff;}
+/* Header TaQur ditanam langsung di index.html agar tidak bergantung pada folder assets. */
+:root{--taqur-header-bg:url('data:image/webp;base64,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');--hijau:#1a4a2e;--hijau-mid:#2d6a44;--hijau-light:#3d8a5a;--emas:#c9a84c;--emas-light:#e8c97a;--emas-pale:#f5e6b8;--krem:#faf6ed;--krem-dark:#f0e8d0;--teks:#1a1a1a;--putih:#ffffff;}
 *{margin:0;padding:0;box-sizing:border-box;}
 body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);min-height:100vh;}
 .header{background:linear-gradient(135deg,var(--hijau) 0%,#0f2d1a 60%,#1a4a2e 100%);position:relative;overflow:hidden;}
@@ -1234,17 +1492,45 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .ticker-item{font-family:'Tajawal',sans-serif;font-size:11px;font-weight:600;letter-spacing:1px;color:var(--emas-light);white-space:nowrap;padding:0 6px;opacity:.95;}
 .ticker-sep{color:var(--emas);font-size:10px;padding:0 4px;opacity:.7;}
 @keyframes ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-.header::before{content:'';position:absolute;inset:0;background:url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='%23c9a84c' fill-opacity='0.06'%3E%3Cpath d='M30 0L60 30L30 60L0 30z'/%3E%3C/g%3E%3C/svg%3E");pointer-events:none;}
-.header-inner{position:relative;padding:18px 20px 10px;text-align:center;}
-.header-title-box{display:inline-block;padding:8px 20px 6px;margin-bottom:6px;position:relative;}
-.header-taqur{font-family:'Cinzel',serif;font-size:64px;font-weight:900;letter-spacing:10px;text-transform:uppercase;display:block;line-height:1;position:relative;background:linear-gradient(180deg,#f5e6a3 0%,#d4b86a 40%,#c8a84c 60%,#a07830 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 8px rgba(212,184,106,.4));}
-.header-taqur::after{content:'TAQUR';position:absolute;inset:0;font-family:'Cinzel',serif;font-size:64px;font-weight:900;letter-spacing:10px;text-transform:uppercase;background:linear-gradient(105deg,transparent 20%,rgba(255,255,255,0) 35%,rgba(255,248,210,.85) 50%,rgba(255,255,255,0) 65%,transparent 80%);background-size:300% 100%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:sheen 5s ease-in-out infinite;pointer-events:none;}
-@keyframes sheen{0%,30%{background-position:200% center;opacity:0}35%{opacity:1}65%{opacity:1}70%,100%{background-position:-100% center;opacity:0}}
-.header-tagline{font-family:'Cinzel',serif;font-size:13px;font-weight:700;letter-spacing:5px;text-transform:uppercase;color:#c8a84c;display:block;margin-top:8px;text-shadow:0 1px 8px rgba(212,184,106,.5);}
-.tagline-farm{color:#a8d8a8;text-shadow:0 1px 10px rgba(140,200,140,.4);}
-.header-badge{display:none;}
-.header h1{display:none;}
-.header-sub{font-size:11px;color:var(--emas-pale);opacity:.75;margin-bottom:12px;}
+.header::before{display:none;}
+.header-inner{
+  position:relative;
+  min-height:clamp(120px,33.333vw,320px);
+  padding:0;
+  overflow:hidden;
+  background-color:#fff8e9;
+  background-repeat:no-repeat;
+  background-position:center center;
+  background-size:contain;
+  background-image:var(--taqur-header-bg);
+  box-shadow:inset 0 -1px 0 rgba(201,168,76,.34);
+}
+.header-inner::after{
+  content:'';
+  position:absolute;
+  inset:auto 0 0;
+  height:24%;
+  background:linear-gradient(to bottom,transparent,rgba(15,45,26,.06));
+  pointer-events:none;
+}
+.header-brand-sr{
+  position:absolute;
+  width:1px;
+  height:1px;
+  padding:0;
+  margin:-1px;
+  overflow:hidden;
+  clip:rect(0,0,0,0);
+  white-space:nowrap;
+  border:0;
+}
+.header-badge,.header h1,.header-title-box,.header-sub{display:none;}
+@media (max-width:520px){
+  .header-inner{
+    min-height:clamp(116px,33.333vw,174px);
+    background-image:var(--taqur-header-bg);
+  }
+}
 .nav-tabs{display:flex;background:rgba(0,0,0,0.3);border-top:1px solid rgba(201,168,76,0.25);}
 .nav-tab{flex:1;padding:9px 1px;text-align:center;font-size:9px;font-weight:500;color:rgba(255,255,255,0.5);cursor:pointer;border:none;background:none;border-bottom:2px solid transparent;transition:all .25s;position:relative;}
 .nav-tab.active{color:var(--emas);border-bottom-color:var(--emas);background:rgba(201,168,76,0.08);}
@@ -1442,6 +1728,9 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .sk-sub li{margin-bottom:4px;}
 .modal-footer{padding:14px 18px;border-top:1px solid var(--krem-dark);display:flex;gap:8px;}
 .modal-footer .btn{flex:1;}
+.participant-session-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;}
+.recovery-link{width:100%;margin-top:4px;background:transparent;border:0;color:var(--hijau-mid);font-family:'Tajawal',sans-serif;font-size:12px;font-weight:700;cursor:pointer;text-decoration:underline;}
+.recovery-note{background:#fff8e1;border:1px solid var(--emas-pale);border-radius:9px;padding:9px 10px;font-size:11px;color:#795548;line-height:1.5;margin-top:8px;}
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
 </style>
@@ -1463,13 +1752,8 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       <span class="ticker-item">TAQUR : TABUNG QURBAN AR RA'I FARM</span><span class="ticker-sep">✦</span>
     </div>
   </div>
-  <div class="header-inner">
-    <div class="header-badge">TaQur — Tabung Qurban</div>
-    <h1>Tabung <span>Qurban</span></h1>
-    <div class="header-title-box">
-      <span class="header-taqur">TAQUR</span>
-      <span class="header-tagline">Tabungan Qurban<br><span class="tagline-farm">Ar-Ra'i Farm</span></span>
-    </div>
+  <div class="header-inner" role="img" aria-label="TaQur — Tabungan Qurban Ar-Ra'i Farm">
+    <span class="header-brand-sr">TaQur — Tabungan Qurban Ar-Ra'i Farm. Amanah, sehat, dan berkualitas.</span>
   </div>
   <div class="nav-tabs">
     <button class="nav-tab active" data-page="dashboard" onclick="showPage('dashboard')"><span class="ti">📊</span>Dashboard</button>
@@ -1535,7 +1819,15 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="form-group">
       <label class="form-label">No. WhatsApp * <span style="font-size:10px;color:var(--emas);font-weight:400">(kode unik Anda)</span></label>
       <input type="tel" class="form-input" id="daftar-hp" placeholder="08xx-xxxx-xxxx">
-      <div style="font-size:11px;color:#888;margin-top:4px">📌 No. HP dipakai untuk setor & cek saldo. Pastikan benar.</div>
+      <div style="font-size:11px;color:#888;margin-top:4px">📌 No. HP dipakai sebagai ID login peserta. Pastikan benar.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Buat PIN Peserta (6 digit) *</label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <input type="password" inputmode="numeric" maxlength="6" class="form-input" id="daftar-pin" placeholder="PIN 6 digit">
+        <input type="password" inputmode="numeric" maxlength="6" class="form-input" id="daftar-pin2" placeholder="Ulangi PIN">
+      </div>
+      <div style="font-size:11px;color:#888;margin-top:4px">🔐 PIN diproses oleh Firebase Authentication dan tidak disimpan di database. Hindari 123456 atau angka berulang.</div>
     </div>
     <div class="form-group">
       <label class="form-label">Alamat Lengkap *</label>
@@ -1610,7 +1902,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="si">🎉</div>
     <h3>Pendaftaran Berhasil!</h3>
     <p>Selamat bergabung dalam program TaQur Ar-Ra'i Farm.<br>Semoga Allah meridhoi niat qurban Anda.</p>
-    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong> khusus Anda.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
+    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Gunakan <strong>No. HP + PIN</strong> sekali per sesi untuk membuka saldo, VA, dan melaporkan setoran. Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong>.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
   </div>
   <div class="ayat-box" style="margin-top:12px">
     <div class="ayat-text">"Tidak ada amalan anak Adam pada hari Nahr yang lebih dicintai Allah selain menyembelih hewan qurban."</div>
@@ -1620,77 +1912,39 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 
 <!-- NO VA -->
 <div id="page-va" class="page">
-  <div class="card">
-    <div class="card-title">🏦 Cek No. VA BSI Saya</div>
-    <div class="form-group">
-      <label class="form-label">No. HP Anda *</label>
-      <div class="hp-row">
-        <input type="tel" class="form-input" id="va-hp" placeholder="08xx-xxxx-xxxx" onkeydown="if(event.key==='Enter')cekVA()">
-        <button class="btn btn-primary" onclick="cekVA()">Cek</button>
-      </div>
-    </div>
-  </div>
-  <div class="alert" id="alert-va"></div>
-  <div id="va-result"></div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="card participant-login-card"><div class="card-title">🔐 Masuk Peserta</div><div style="font-size:12px;color:#666;margin-bottom:10px">Masuk sekali untuk membuka VA, laporan setoran, saldo, dan riwayat selama sesi ini.</div>
+    <div class="form-group"><label class="form-label">No. HP *</label><input type="tel" class="form-input" id="va-hp" placeholder="08xx-xxxx-xxxx"></div>
+    <div class="form-group"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="va-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cekVA()"><button class="btn btn-primary" onclick="cekVA()">Masuk</button></div></div>
+    <button class="recovery-link" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button>
+  </div><div class="alert" id="alert-va"></div><div id="va-result"></div>
 </div>
 
 <!-- SETOR -->
 <div id="page-setor" class="page">
-  <div class="card">
-    <div class="card-title">💰 Input Setoran TaQur</div>
-    <div class="alert" id="alert-setor"></div>
-    <div class="form-group">
-      <label class="form-label">No. HP Penabung * <span style="font-size:10px;color:var(--emas);font-weight:400">(kode unik)</span></label>
-      <div class="hp-row">
-        <input type="tel" class="form-input" id="setor-hp" placeholder="08xx-xxxx-xxxx">
-        <button class="btn btn-outline" onclick="cariPesertaSetor()">Cari</button>
-      </div>
-      <div id="setor-info" style="display:none;margin-top:6px"></div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="card"><div class="card-title">💰 Input Setoran TaQur</div><div class="alert" id="alert-setor"></div>
+    <div class="form-group participant-login-fields"><label class="form-label">No. HP Penabung *</label><input type="tel" class="form-input" id="setor-hp" placeholder="08xx-xxxx-xxxx"></div>
+    <div class="form-group participant-login-fields"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="setor-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cariPesertaSetor()"><button class="btn btn-outline" onclick="cariPesertaSetor()">Masuk</button></div></div><button class="recovery-link participant-login-fields" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button><div id="setor-info" style="display:none;margin:6px 0 10px"></div>
+    <div class="participant-protected-content" style="display:none">
+      <div class="form-group"><label class="form-label">Jumlah Setoran (Rp) *</label><div style="position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:#888;font-weight:600;pointer-events:none">Rp</span><input type="text" inputmode="numeric" class="form-input" id="setor-nominal" placeholder="0" style="padding-left:34px;font-weight:700;font-size:15px;letter-spacing:.5px" oninput="formatNominalSetor(this)"></div><div id="setor-nominal-hint" style="font-size:11px;color:var(--hijau-mid);margin-top:4px;display:none"></div></div>
+      <div class="form-group"><label class="form-label">Tanggal Setoran *</label><input type="date" class="form-input" id="setor-tgl"></div>
+      <div class="form-group"><label class="form-label">Catatan (opsional)</label><input type="text" class="form-input" id="setor-catatan" placeholder="Misal: setoran minggu ke-3"></div>
+      <div class="target-info">ℹ️ Ini adalah laporan untuk meminta admin mengecek mutasi/VA. Saldo hanya bertambah setelah dana benar-benar ditemukan dan dikonfirmasi admin.</div><button class="btn btn-gold" id="btn-setor" onclick="inputSetoran()" style="margin-top:10px">📤 Laporkan Setoran</button><div id="setor-notify" style="display:none;margin-top:10px;padding:10px;background:#fff8e1;border:1px solid var(--emas-pale);border-radius:10px"></div>
     </div>
-    <div class="form-group">
-      <label class="form-label">Jumlah Setoran (Rp) *</label>
-      <div style="position:relative">
-        <span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:#888;font-weight:600;pointer-events:none">Rp</span>
-        <input type="text" inputmode="numeric" class="form-input" id="setor-nominal" placeholder="0" style="padding-left:34px;font-weight:700;font-size:15px;letter-spacing:.5px" oninput="formatNominalSetor(this)">
-      </div>
-      <div id="setor-nominal-hint" style="font-size:11px;color:var(--hijau-mid);margin-top:4px;display:none"></div>
-    </div>
-    <div class="form-group"><label class="form-label">Tanggal Setoran *</label><input type="date" class="form-input" id="setor-tgl"></div>
-    <div class="form-group"><label class="form-label">Catatan (opsional)</label><input type="text" class="form-input" id="setor-catatan" placeholder="Misal: setoran minggu ke-3"></div>
-    <div class="target-info">
-      ℹ️ Saldo akan terupdate setelah admin mengkonfirmasi dana telah masuk ke rekening.
-    </div>
-    <button class="btn btn-gold" id="btn-setor" onclick="inputSetoran()" style="margin-top:10px">📤 Kirim Setoran</button>
   </div>
 </div>
 
 <!-- CEK SALDO -->
 <div id="page-cek" class="page">
-  <div class="card">
-    <div class="card-title">🔍 Cek Saldo TaQur</div>
-    <div class="form-group">
-      <label class="form-label">No. HP Anda *</label>
-      <div class="hp-row">
-        <input type="tel" class="form-input" id="cek-hp" placeholder="08xx-xxxx-xxxx" onkeydown="if(event.key==='Enter')cekSaldo()">
-        <button class="btn btn-primary" onclick="cekSaldo()">Cek</button>
-      </div>
-    </div>
-  </div>
-  <div class="alert" id="alert-cek"></div>
-  <div class="saldo-result" id="saldo-result">
-    <div class="saldo-card">
-      <div class="s-nama"  id="res-nama">—</div>
-      <div class="s-hp"    id="res-hp">—</div>
-      <div class="s-jenis" id="res-jenis">—</div>
-      <span class="s-angka" id="res-saldo">Rp 0</span>
-      <div class="s-label">Total Saldo Dikonfirmasi</div>
-      <div class="s-progress"><div class="s-pfill" id="res-bar" style="width:0%"></div></div>
-      <div class="s-pct"   id="res-pct">0%</div>
-      <div class="s-target" id="res-target"></div>
-      <div class="pending-notice" id="res-pending" style="display:none;margin-top:10px"></div>
-    </div>
-    <div class="card"><div class="card-title">📋 Riwayat Setoran</div><div id="res-history"></div></div>
-  </div>
+  <div class="participant-session-bar" style="display:none;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:#e8f5e9;border-radius:9px;padding:8px 10px;margin-bottom:8px"><span class="participant-session-name" style="font-size:12px;font-weight:700;color:var(--hijau)"></span><div class="participant-session-actions"><button class="btn btn-outline btn-sm" onclick="ubahPinSaya()">Ubah PIN</button><button class="btn btn-outline btn-sm participant-recovery-btn" onclick="aktifkanPemulihanGoogle()">🔑 Aktifkan Google</button><button class="btn btn-outline btn-sm" onclick="pesertaLogout()">Keluar</button></div></div>
+  <div class="card participant-login-card"><div class="card-title">🔐 Masuk Peserta</div><div style="font-size:12px;color:#666;margin-bottom:10px">Masuk sekali untuk membuka saldo, VA, dan laporan setoran selama sesi ini.</div>
+    <div class="form-group"><label class="form-label">No. HP *</label><input type="tel" class="form-input" id="cek-hp" placeholder="08xx-xxxx-xxxx"></div>
+    <div class="form-group"><label class="form-label">PIN Peserta *</label><div class="hp-row"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="cek-pin" placeholder="6 digit PIN" onkeydown="if(event.key==='Enter')cekSaldo()"><button class="btn btn-primary" onclick="cekSaldo()">Masuk & Cek</button></div></div>
+    <button class="recovery-link" onclick="lupaPinPeserta()">Lupa PIN? Pulihkan dengan Google</button>
+    <div class="recovery-note">Pemulihan mandiri hanya bisa digunakan setelah akun Google ditautkan saat masih bisa masuk.</div>
+  </div><div class="alert" id="alert-cek"></div>
+  <div class="saldo-result" id="saldo-result"><div class="saldo-card"><div class="s-nama" id="res-nama">—</div><div class="s-hp" id="res-hp">—</div><div class="s-jenis" id="res-jenis">—</div><span class="s-angka" id="res-saldo">Rp 0</span><div class="s-label">Total Saldo Dikonfirmasi</div><div class="s-progress"><div class="s-pfill" id="res-bar" style="width:0%"></div></div><div class="s-pct" id="res-pct">0%</div><div class="s-target" id="res-target"></div><div class="pending-notice" id="res-pending" style="display:none;margin-top:10px"></div></div><div class="card"><div class="card-title">📋 Riwayat Setoran</div><div id="res-history"></div></div></div>
 </div>
 
 <!-- ADMIN -->
@@ -1699,9 +1953,9 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="admin-login">
       <h2>🔐 Admin TaQur</h2>
       <p>Khusus Admin TaQur Ar-Ra'i Farm</p>
-      <input type="text"     class="form-input" id="admin-user" placeholder="Username">
+      <input type="email" class="form-input" id="admin-user" placeholder="Email admin">
       <input type="password" class="form-input" id="admin-pass" placeholder="Password" onkeydown="if(event.key==='Enter')adminLogin()">
-      <button class="btn btn-gold" style="margin-top:4px" onclick="adminLogin()">Masuk</button>
+      <button class="btn btn-gold" style="margin-top:4px" onclick="adminLogin()">Masuk Aman</button><button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="kirimResetAdmin()">Lupa password admin</button>
       <div class="alert" id="alert-admin" style="margin-top:10px;text-align:left"></div>
     </div>
   </div>
@@ -1720,7 +1974,9 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       <button class="adm-tab-btn active" onclick="showAdmTab('pending',this)">⏳ Pending</button>
       <button class="adm-tab-btn" onclick="showAdmTab('peserta',this)">👥 Peserta</button>
       <button class="adm-tab-btn" onclick="showAdmTab('rekap',this)">📊 Rekap</button>
-      <button class="adm-tab-btn" onclick="showAdmTab('setting',this)">⚙️ Setting</button>
+      <button class="adm-tab-btn superadmin-only" onclick="showAdmTab('setting',this)">⚙️ Setting</button>
+      <button class="adm-tab-btn superadmin-only" onclick="showAdmTab('security',this)">🔐 Keamanan</button>
+      <button class="adm-tab-btn superadmin-only" onclick="showAdmTab('audit',this)">🧾 Audit</button>
     </div>
     <div id="adm-tab-pending">
       <div class="alert" id="alert-adm-panel"></div>
@@ -1733,7 +1989,8 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
           <button class="filter-btn" data-filter="va-belum"        onclick="setFilter('va-belum')">⚠️ Belum VA</button>
           <button class="filter-btn" data-filter="va-ok"           onclick="setFilter('va-ok')">✅ Ada VA</button>
           <button class="filter-btn" data-filter="aktif"           onclick="setFilter('aktif')">Sudah Setor</button>
-          <button class="filter-btn" data-filter="belum"           onclick="setFilter('belum')">Belum Setor</button>
+          <button class="filter-btn" data-filter="belum" onclick="setFilter('belum')">Belum Setor</button>
+          <button class="filter-btn" data-filter="akun-belum" onclick="setFilter('akun-belum')">🔓 Belum PIN</button>
         </div>
         <div class="sort-row">
           <span>Urutkan:</span>
@@ -1797,11 +2054,47 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
         <button class="btn btn-gold" onclick="exportCSV()">📋 Export Rekap Setoran Detail (CSV)</button>
         <p style="font-size:11px;color:#888;margin-top:6px">Semua setoran dikonfirmasi + tanggal & catatan rekonsiliasi</p>
       </div>
+
+    <div id="adm-tab-security" class="superadmin-only" style="display:none">
+      <div class="alert" id="alert-security"></div>
+      <div class="card" style="border:2px solid var(--hijau)"><div class="card-title">👤 Tambah Admin</div>
+        <div class="form-group"><label class="form-label">Nama</label><input class="form-input" id="sec-admin-nama" placeholder="Nama admin"></div>
+        <div class="form-group"><label class="form-label">Email</label><input type="email" class="form-input" id="sec-admin-email" placeholder="admin@email.com"></div>
+        <div class="recovery-note" style="margin-bottom:10px">Superadmin tidak perlu membuat atau mengetahui password. Sistem membuat akun sementara lalu mengirim email agar admin menetapkan password sendiri.</div>
+        <div class="form-group"><label class="form-label">Role</label><select class="form-input" id="sec-admin-role"><option value="admin">Admin</option><option value="superadmin">Super Admin</option></select></div>
+        <button class="btn btn-primary" onclick="buatAdminBaru()">✉️ Kirim Undangan Admin</button></div>
+      <div class="card"><div class="card-title">🛡️ Daftar Admin</div><div id="security-admin-list"></div></div>
+      <div class="card"><div class="card-title">🔄 Sinkronisasi Data Publik</div><p style="font-size:12px;color:#666;margin-bottom:10px">Memperbarui statistik dan leaderboard publik tanpa membuka data pribadi peserta.</p><button class="btn btn-gold" onclick="syncPublicDashboard()">Sinkronkan Dashboard Publik</button></div>
+    </div>
+    <div id="adm-tab-audit" class="superadmin-only" style="display:none">
+      <div class="card"><div class="card-title">🧾 100 Aktivitas Terakhir</div><button class="btn btn-outline btn-sm" onclick="refreshAudit()" style="margin-bottom:10px">Muat Ulang</button><div id="audit-list"></div></div>
+    </div>
     </div>
   </div>
 </div>
 
-<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert</span></div>
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v3</span></div>
+
+<!-- MODAL RESET PIN VIA GOOGLE -->
+<div id="modal-reset-pin" class="modal-overlay" onclick="tutupModalPinBaru(event)">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title">🔑 Buat PIN Baru</div>
+      <div class="modal-subtitle">Akun dipulihkan melalui Google tanpa mengganti data peserta</div>
+      <button class="modal-close" onclick="tutupModalPinBaru()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="alert" id="alert-recovery-pin"></div>
+      <div class="form-group"><label class="form-label">PIN Baru *</label><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="recovery-pin-new" placeholder="6 digit PIN"></div>
+      <div class="form-group"><label class="form-label">Ulangi PIN Baru *</label><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="recovery-pin-confirm" placeholder="Ulangi 6 digit PIN" onkeydown="if(event.key==='Enter')simpanPinPemulihan()"></div>
+      <div class="recovery-note">Gunakan PIN yang tidak mudah ditebak. Hindari tanggal lahir, 123456, atau angka berulang.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="btn-save-recovery-pin" onclick="simpanPinPemulihan()">✅ Simpan PIN Baru</button>
+      <button class="btn btn-outline" onclick="tutupModalPinBaru()">Batal</button>
+    </div>
+  </div>
+</div>
 
 <!-- MODAL SYARAT & KETENTUAN -->
 <div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
