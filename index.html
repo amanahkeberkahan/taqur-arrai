@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
-<meta name="taqur-build" content="security-v5-security-tab-fix">
+<meta name="taqur-build" content="scale-ready-v8-referral-va-realtime">
 <meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
 <meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
 <meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
@@ -27,7 +27,8 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import {
   getFirestore, collection, addDoc, getDocs, getDoc, setDoc, doc,
-  updateDoc, query, where, orderBy, serverTimestamp, writeBatch, limit
+  updateDoc, query, where, orderBy, serverTimestamp, writeBatch, limit,
+  onSnapshot, increment
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import {
   getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
@@ -105,6 +106,15 @@ const adminContactMessage = adminName => {
   return `*[PENGUNJUNG TAQUR]*\nAssalamu'alaikum Admin ${adminName}. Saya menghubungi melalui aplikasi TaQur Ar-Ra'i Farm.\nNama: \nStatus: calon peserta / belum login\n\nSaya ingin menanyakan terkait:\n`;
 };
 const adminWaUrl = k => `https://wa.me/${normHP(String(k.hp||''))}?text=${encodeURIComponent(adminContactMessage(k.nama||'TaQur'))}`;
+const normalizeReferralCode = value => String(value||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'');
+const generateVA = hp => {
+  const local = normHP(String(hp||'')).replace(/^62/,'');
+  return local.length >= 10 ? '834576' + local.slice(0,10) : '';
+};
+const vaStatusLabel = status => status==='active' ? 'Aktif' : status==='rejected' ? 'Perlu Perbaikan' : 'Menunggu Aktivasi';
+const effectiveVAStatus = p => p?.statusVA || (p?.nomorVA ? 'active' : 'review');
+window.normalizeReferralCode=normalizeReferralCode;
+
 const pinValid = pin => /^\d{6}$/.test(pin) && !['000000','111111','123456','654321'].includes(pin);
 const randomSuffix = () => Math.random().toString(36).slice(2,8) + Date.now().toString(36).slice(-4);
 const participantAliasEmail = hp => `p.${hp}.${randomSuffix()}@login.taqur.id`;
@@ -131,12 +141,52 @@ const tglFull = ts => {
   return d.toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'});
 };
 
+let popupTimer=null;
+function ensureAppPopup(){
+  let el=document.getElementById('app-global-popup');
+  if(el) return el;
+  el=document.createElement('div');
+  el.id='app-global-popup';
+  el.className='app-popup-overlay';
+  el.innerHTML=`<div class="app-popup-card" role="dialog" aria-modal="true" aria-labelledby="app-popup-title">
+    <div class="app-popup-icon" id="app-popup-icon">⚠️</div>
+    <div class="app-popup-title" id="app-popup-title">Pemberitahuan</div>
+    <div class="app-popup-message" id="app-popup-message"></div>
+    <button class="btn btn-primary" onclick="closeAppPopup()">Mengerti</button>
+  </div>`;
+  document.body.appendChild(el);
+  el.addEventListener('click',e=>{if(e.target===el)closeAppPopup();});
+  return el;
+}
+window.closeAppPopup=function(){
+  clearTimeout(popupTimer);
+  const el=document.getElementById('app-global-popup');
+  if(el) el.classList.remove('open');
+};
+function showPopup(type,msg,title=''){
+  const el=ensureAppPopup();
+  const map={success:['✅','Berhasil'],error:['⚠️','Perlu Diperbaiki'],warning:['⚠️','Perhatian'],info:['ℹ️','Informasi']};
+  const cfg=map[type]||map.info;
+  document.getElementById('app-popup-icon').textContent=cfg[0];
+  document.getElementById('app-popup-title').textContent=title||cfg[1];
+  document.getElementById('app-popup-message').textContent=String(msg||'');
+  el.dataset.type=type||'info';
+  el.classList.add('open');
+  clearTimeout(popupTimer);
+  if(type==='success') popupTimer=setTimeout(closeAppPopup,3500);
+}
+window.alert=function(msg){
+  const s=String(msg||'');
+  showPopup(s.includes('✅')?'success':(s.toLowerCase().includes('gagal')||s.includes('❌')?'error':'warning'),s.replace(/^✅\s*|^⚠️\s*|^❌\s*/,''));
+};
 function showAlert(id, type, msg) {
   const el = document.getElementById(id);
-  if (!el) return;
-  el.className = 'alert ' + type + ' show';
-  el.textContent = msg;
-  setTimeout(() => el.classList.remove('show'), 5000);
+  if (el) {
+    el.className = 'alert ' + type + ' show';
+    el.textContent = msg;
+    setTimeout(() => el.classList.remove('show'), 5000);
+  }
+  showPopup(type,msg);
 }
 function setLoading(id, on) {
   const el = document.getElementById(id);
@@ -215,51 +265,52 @@ window.showPage = function(id) {
 // ============================================================
 // DASHBOARD PUBLIK — hanya membaca dokumen ringkasan tanpa data pribadi
 // ============================================================
-async function loadDashboard() {
-  try {
-    const [statSnap, topSnap] = await Promise.all([
-      getDoc(doc(db,'public_stats','overview')),
-      getDoc(doc(db,'leaderboard_public','top5'))
-    ]);
-    const stat = statSnap.exists() ? statSnap.data() : {};
-    const peserta = Number(stat.totalPeserta||0);
-    const totalDana = Number(stat.totalDana||0);
-    const totalTarget = Number(stat.totalTarget||0);
-    const pc = pct(totalDana,totalTarget);
-
-    document.getElementById('dash-peserta').textContent = peserta;
-    document.getElementById('dash-total').textContent = rp(totalDana);
-    document.getElementById('dash-pct').textContent = pc+'%';
-    document.getElementById('dash-collected').textContent = 'Terkumpul: '+rp(totalDana);
-    document.getElementById('dash-pct2').textContent = pc+'%';
-    document.getElementById('dash-bar').style.width = pc+'%';
-    document.getElementById('dash-target-label').textContent = 'Target kolektif: '+rp(totalTarget);
-    document.getElementById('dash-target-sub').textContent = `${peserta} peserta · data publik terakhir disinkronkan admin`;
-
-    const items = (topSnap.exists() && Array.isArray(topSnap.data().items) ? topSnap.data().items : [])
-      .filter(p => Number(p.saldo||0) > 0);
-    const top5El = document.getElementById('dash-top5');
-    const seeBtn = document.getElementById('see-all-btn');
-    seeBtn.style.display='none';
-    if (!items.length) {
-      top5El.innerHTML='<div class="empty-state"><div class="ei">🌱</div><p>Belum ada setoran terkonfirmasi.<br><small>Progress akan tampil setelah admin mengonfirmasi setoran.</small></p></div>';
-      return;
-    }
-    const rankClass=['rank-1','rank-2','rank-3','rank-n','rank-n'];
-    const rankLabel=['🥇','🥈','🥉','4','5'];
-    top5El.innerHTML=items.slice(0,5).map((p,i)=>`<div class="top-item">
-      <div class="top-rank ${rankClass[i]}">${rankLabel[i]}</div>
-      <div class="top-info">
-        <div class="top-nama">${esc(p.namaMasked)}</div>
-        <div class="top-jenis">${esc(p.jenis)}</div>
-        <div class="mini-bar" style="margin-top:3px"><div class="mini-fill" style="width:${Number(p.progress||0)}%"></div></div>
-      </div>
-      <div class="top-saldo"><div class="top-nom">${rp(p.saldo)}</div><div class="top-pct">${Number(p.progress||0)}% target</div></div>
-    </div>`).join('');
-  } catch(e) {
-    document.getElementById('dash-top5').innerHTML='<div class="empty-state"><p>⚠️ Dashboard publik belum tersedia.<br><small>Admin perlu melakukan sinkronisasi awal.</small></p></div>';
+let dashboardRealtimeStarted=false;
+let dashboardStatCache={};
+let dashboardTopCache=[];
+function renderDashboardRealtime(){
+  const stat=dashboardStatCache||{};
+  const peserta=Number(stat.totalPeserta||0);
+  const totalDana=Number(stat.totalDana||0);
+  const totalTarget=Number(stat.totalTarget||0);
+  const pc=pct(totalDana,totalTarget);
+  document.getElementById('dash-peserta').textContent=peserta;
+  document.getElementById('dash-total').textContent=rp(totalDana);
+  document.getElementById('dash-pct').textContent=pc+'%';
+  document.getElementById('dash-collected').textContent='Terkumpul: '+rp(totalDana);
+  document.getElementById('dash-pct2').textContent=pc+'%';
+  document.getElementById('dash-bar').style.width=pc+'%';
+  document.getElementById('dash-target-label').textContent='Target kolektif: '+rp(totalTarget);
+  document.getElementById('dash-target-sub').textContent=`${peserta} peserta · diperbarui otomatis`;
+  const items=(dashboardTopCache||[]).filter(p=>Number(p.saldo||0)>0);
+  const top5El=document.getElementById('dash-top5');
+  const seeBtn=document.getElementById('see-all-btn');
+  if(seeBtn) seeBtn.style.display='none';
+  if(!items.length){
+    top5El.innerHTML='<div class="empty-state"><div class="ei">🌱</div><p>Belum ada setoran terkonfirmasi.<br><small>Progress akan tampil otomatis setelah admin mengonfirmasi setoran.</small></p></div>';
+    return;
   }
+  const rankClass=['rank-1','rank-2','rank-3','rank-n','rank-n'];
+  const rankLabel=['🥇','🥈','🥉','4','5'];
+  top5El.innerHTML=items.slice(0,5).map((p,i)=>`<div class="top-item">
+    <div class="top-rank ${rankClass[i]}">${rankLabel[i]}</div>
+    <div class="top-info"><div class="top-nama">${esc(p.namaMasked)}</div><div class="top-jenis">${esc(p.jenis)}</div><div class="mini-bar" style="margin-top:3px"><div class="mini-fill" style="width:${Number(p.progress||0)}%"></div></div></div>
+    <div class="top-saldo"><div class="top-nom">${rp(p.saldo)}</div><div class="top-pct">${Number(p.progress||0)}% target</div></div>
+  </div>`).join('');
 }
+function startDashboardRealtime(){
+  if(dashboardRealtimeStarted) return;
+  dashboardRealtimeStarted=true;
+  onSnapshot(doc(db,'public_stats','overview'),snap=>{
+    dashboardStatCache=snap.exists()?snap.data():{};
+    renderDashboardRealtime();
+  },()=>{document.getElementById('dash-top5').innerHTML='<div class="empty-state"><p>⚠️ Dashboard publik belum tersedia.</p></div>';});
+  onSnapshot(doc(db,'leaderboard_public','top5'),snap=>{
+    dashboardTopCache=snap.exists()&&Array.isArray(snap.data().items)?snap.data().items:[];
+    renderDashboardRealtime();
+  },console.warn);
+}
+async function loadDashboard(){ startDashboardRealtime(); }
 
 // ============================================================
 // ESTIMASI HARGA
@@ -602,6 +653,7 @@ window.daftarPeserta = async function() {
   const target=parseInt(document.getElementById('daftar-target').value);
   const pin=document.getElementById('daftar-pin').value.trim();
   const pin2=document.getElementById('daftar-pin2').value.trim();
+  const referralCode=normalizeReferralCode(document.getElementById('daftar-referral')?.value||'');
   if(!nama) return showAlert('alert-daftar','error','Nama tidak boleh kosong.');
   if(!hp||hp.length<10) return showAlert('alert-daftar','error','No. HP tidak valid.');
   if(!alamat||alamat.length<10) return showAlert('alert-daftar','error','Mohon isi alamat lengkap.');
@@ -610,44 +662,63 @@ window.daftarPeserta = async function() {
   if(!pinValid(pin)) return showAlert('alert-daftar','error','PIN harus 6 digit dan tidak boleh terlalu mudah.');
   if(pin!==pin2) return showAlert('alert-daftar','error','Konfirmasi PIN tidak sama.');
   setLoading('btn-daftar',true);
+  let registrationCommitted=false;
   try {
+    let referral={code:'',label:'',status:'none'};
+    if(referralCode){
+      const referralSnap=await getDoc(doc(db,'referral_codes',referralCode));
+      if(!referralSnap.exists()||referralSnap.data().active!==true){
+        document.getElementById('daftar-referral')?.focus();
+        throw new Error('Kode referral tidak valid atau sudah tidak aktif. Perbaiki kode, atau kosongkan kolom untuk melanjutkan tanpa referral.');
+      }
+      referral={code:referralCode,label:referralSnap.data().label||referralSnap.data().nama||referralCode,status:'valid'};
+    }
     const existing=await getDoc(doc(db,'login_lookup',hp));
     if(existing.exists()) throw new Error('No. HP sudah terdaftar. Gunakan login atau hubungi admin.');
+    const nomorVA=generateVA(hp);
     await signOut(helperAuth).catch(()=>{});
     const loginEmail=participantAliasEmail(hp);
     const cred=await createUserWithEmailAndPassword(helperAuth,loginEmail,pin);
     const uid=cred.user.uid;
+    let vaAvailable=!!nomorVA;
+    if(nomorVA){
+      const vaCheck=await getDoc(doc(helperDb,'va_registry',nomorVA));
+      vaAvailable=!vaCheck.exists();
+    }
+    const statSnap=await getDoc(doc(helperDb,'public_stats','overview')).catch(()=>null);
     const batch=writeBatch(helperDb);
-    batch.set(doc(helperDb,'users',uid),{
-      nama,hp,role:'participant',active:true,participantId:uid,loginEmail,
-      createdAt:serverTimestamp(),createdBy:'self-registration'
-    });
+    batch.set(doc(helperDb,'users',uid),{nama,hp,role:'participant',active:true,participantId:uid,loginEmail,createdAt:serverTimestamp(),createdBy:'self-registration'});
     batch.set(doc(helperDb,'peserta',uid),{
-      nama,hp,alamat,jenis,targetNominal:target,nomorVA:'',authUid:uid,
-      statusAkun:'active',tglDaftar:serverTimestamp()
+      nama,hp,alamat,jenis,targetNominal:target,
+      nomorVA:vaAvailable?nomorVA:'',statusVA:vaAvailable?'pending':'review',vaSource:vaAvailable?'auto':'collision-review',
+      referralCode:referral.code,referralLabel:referral.label,referralStatus:referral.status,
+      authUid:uid,statusAkun:'active',saldoConfirmed:0,jumlahSetorConfirmed:0,pendingSetoran:0,lastSetorAt:null,tglDaftar:serverTimestamp(),tglGenerateVA:vaAvailable?serverTimestamp():null
     });
-    batch.set(doc(helperDb,'login_lookup',hp),{
-      hp,uid,participantId:uid,loginEmail,active:true,registered:true,updatedAt:serverTimestamp()
-    });
+    batch.set(doc(helperDb,'login_lookup',hp),{hp,uid,participantId:uid,loginEmail,active:true,registered:true,updatedAt:serverTimestamp()});
+    if(vaAvailable){batch.set(doc(helperDb,'va_registry',nomorVA),{nomorVA,participantId:uid,uid,status:'pending',createdAt:serverTimestamp()});}
+    if(statSnap?.exists()){
+      batch.set(doc(helperDb,'public_stats','overview'),{totalPeserta:increment(1),totalTarget:increment(target),updatedAt:serverTimestamp(),updatedBy:uid},{merge:true});
+    }
     await batch.commit();
-    await addDoc(collection(helperDb,'audit_logs'),{
-      action:'PARTICIPANT_REGISTER',targetType:'peserta',targetId:uid,
-      actorUid:uid,actorName:nama,actorRole:'participant',details:{jenis,targetNominal:target},timestamp:serverTimestamp()
-    });
+    registrationCommitted=true;
+    await addDoc(collection(helperDb,'audit_logs'),{action:'PARTICIPANT_REGISTER',targetType:'peserta',targetId:uid,actorUid:uid,actorName:nama,actorRole:'participant',details:{jenis,targetNominal:target,referralCode:referral.code,nomorVA:vaAvailable?nomorVA:'REVIEW'},timestamp:serverTimestamp()});
     await signOut(helperAuth);
     lastRegisteredParticipant={nama,hp};
     await renderKontakDynamic().catch(console.warn);
-    ['daftar-nama','daftar-hp','daftar-alamat','daftar-pin','daftar-pin2'].forEach(id=>document.getElementById(id).value='');
+    ['daftar-nama','daftar-hp','daftar-alamat','daftar-pin','daftar-pin2','daftar-referral'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+    document.getElementById('referral-status').textContent='';
     document.getElementById('daftar-jenis').value='';
     document.getElementById('daftar-target').value='';
     document.getElementById('custom-target-input').value='';
     document.getElementById('custom-hint').style.display='none';
     document.getElementById('paket-selected-info').style.display='none';
     document.querySelectorAll('.paket-list-item').forEach(c=>c.classList.remove('selected'));
-    const cb=document.getElementById('setuju-sk'); cb.checked=false; cb.disabled=true; toggleBtnDaftar();
+    const cb=document.getElementById('setuju-sk');cb.checked=false;cb.disabled=true;toggleBtnDaftar();
     document.getElementById('daftar-sukses').style.display='block';
     document.getElementById('daftar-sukses').scrollIntoView({behavior:'smooth'});
+    showPopup('success',vaAvailable?'Pendaftaran berhasil. Nomor VA telah dibuat dan sedang menunggu aktivasi admin/BSI.':'Pendaftaran berhasil. Nomor VA memerlukan pemeriksaan admin karena terdeteksi benturan pola.');
   } catch(e) {
+    if(!registrationCommitted&&helperAuth.currentUser)await deleteUser(helperAuth.currentUser).catch(()=>{});
     await signOut(helperAuth).catch(()=>{});
     showAlert('alert-daftar','error','Gagal mendaftar: '+authMessage(e));
   }
@@ -662,20 +733,65 @@ async function loadPesertaCache(){
 }
 
 // ============================================================
+// KODE REFERRAL
+// ============================================================
+window.cekKodeReferral=async function(){
+  const input=document.getElementById('daftar-referral');
+  const status=document.getElementById('referral-status');
+  if(!input||!status)return;
+  const code=normalizeReferralCode(input.value);
+  input.value=code;
+  if(!code){status.textContent='Opsional — kosongkan jika tidak memiliki kode referral.';status.className='referral-status';return;}
+  status.textContent='Memeriksa kode...';status.className='referral-status checking';
+  try{
+    const snap=await getDoc(doc(db,'referral_codes',code));
+    if(!snap.exists()||snap.data().active!==true)throw new Error('Kode referral tidak valid atau tidak aktif.');
+    status.textContent='✅ Kode valid: '+(snap.data().label||code);status.className='referral-status valid';
+  }catch(e){status.textContent='⚠️ '+e.message+' Perbaiki atau kosongkan kolom.';status.className='referral-status invalid';}
+};
+async function loadReferralCodes(){
+  if(currentAdmin?.role!=='superadmin')return;
+  const el=document.getElementById('referral-code-list');if(!el)return;
+  const snap=await getDocs(collection(db,'referral_codes'));
+  const rows=snap.docs.map(d=>({code:d.id,...d.data()})).sort((a,b)=>a.code.localeCompare(b.code));
+  el.innerHTML=rows.length?rows.map(r=>{
+    const count=allPeserta.filter(p=>p.referralCode===r.code).length;
+    return `<div class="referral-admin-row"><div><strong>${esc(r.code)}</strong><div>${esc(r.label||'-')} · ${count} peserta</div></div><button class="btn btn-outline btn-sm" onclick="toggleReferralCode('${esc(r.code)}',${r.active!==true})">${r.active===true?'Nonaktifkan':'Aktifkan'}</button></div>`;
+  }).join(''):'<div class="empty-state"><p>Belum ada kode referral.</p></div>';
+}
+window.buatKodeReferral=async function(){
+  const code=normalizeReferralCode(document.getElementById('referral-admin-code')?.value||'');
+  const label=document.getElementById('referral-admin-label')?.value.trim()||'';
+  if(!code||code.length<3)return showAlert('alert-referral-admin','error','Kode referral minimal 3 karakter.');
+  if(!label)return showAlert('alert-referral-admin','error','Nama sumber/referral wajib diisi.');
+  try{
+    const ref=doc(db,'referral_codes',code);
+    if((await getDoc(ref)).exists())throw new Error('Kode referral sudah digunakan.');
+    await setDoc(ref,{code,label,active:true,createdAt:serverTimestamp(),createdBy:currentAdmin.uid});
+    await writeAudit('CREATE_REFERRAL_CODE','referral_codes',code,{label});
+    document.getElementById('referral-admin-code').value='';document.getElementById('referral-admin-label').value='';
+    showAlert('alert-referral-admin','success','Kode referral berhasil dibuat.');await loadReferralCodes();
+  }catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
+};
+window.toggleReferralCode=async function(code,active){
+  try{await updateDoc(doc(db,'referral_codes',code),{active,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid});await writeAudit(active?'ENABLE_REFERRAL_CODE':'DISABLE_REFERRAL_CODE','referral_codes',code,{});await loadReferralCodes();}
+  catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
+};
+
+// ============================================================
 // CEK VA
 // ============================================================
 function renderVAResult(p){
   const resEl=document.getElementById('va-result');
+  const status=p.statusVA||(p.nomorVA?'active':'review');
   if(!p.nomorVA){
-    resEl.innerHTML=`<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center">
-      <div style="font-size:36px;margin-bottom:8px">⏳</div><div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Belum Tersedia</div>
-      <div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6">Halo <strong>${esc(p.nama)}</strong>, No. VA BSI Anda sedang disiapkan admin.</div></div>`;
+    resEl.innerHTML=`<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center"><div style="font-size:36px;margin-bottom:8px">⏳</div><div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Dalam Pemeriksaan</div><div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6">Halo <strong>${esc(p.nama)}</strong>, pola nomor VA Anda memerlukan pemeriksaan admin. Mohon tunggu maksimal 1×24 jam atau hubungi admin.</div></div>`;
+  }else if(status!=='active'){
+    resEl.innerHTML=`<div class="va-card va-pending-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Calon Virtual Account BSI</div><div class="va-number">${esc(p.nomorVA)}</div><div class="va-status pending">⏳ Menunggu Aktivasi Admin / BSI</div><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div></div></div><div class="va-alert-critical">⚠️ Nomor VA belum aktif. Jangan melakukan transfer. Hubungi admin untuk aktivasi atau tunggu maksimal 1×24 jam.</div>`;
+    const key='taqur-va-pending-'+p.id;
+    if(!sessionStorage.getItem(key)){sessionStorage.setItem(key,'1');setTimeout(()=>showPopup('warning','Nomor VA Anda sudah dibuat, tetapi belum aktif. Jangan transfer sebelum status berubah menjadi Aktif. Hubungi admin atau tunggu maksimal 1×24 jam.'),100);}
   }else{
-    resEl.innerHTML=`<div class="va-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Virtual Account BSI</div>
-      <div class="va-number">${esc(p.nomorVA)}</div><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div>
-      <div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div>
-      <div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div></div></div>
-      <div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div>`;
+    resEl.innerHTML=`<div class="va-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Virtual Account BSI</div><div class="va-status active">✅ Aktif</div><div class="va-number">${esc(p.nomorVA)}</div><button class="btn-copy" id="btn-copy-va" onclick="copyText('${esc(p.nomorVA)}','btn-copy-va')">📋 Salin No. VA</button><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div><div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div></div></div><div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div><div class="va-transfer-note"><strong>Transfer dari bank selain BSI:</strong> jangan menggunakan BI-FAST. Pilih metode <strong>Transfer Online</strong> agar transaksi Virtual Account dapat diproses.</div>`;
   }
   resEl.style.display='block';
 }
@@ -703,7 +819,7 @@ function renderSetorParticipant(p){
   el.innerHTML=`<div class="peserta-found"><div class="avatar" style="width:32px;height:32px;font-size:14px">${esc(p.nama.charAt(0).toUpperCase())}</div>
     <div style="flex:1"><div style="font-weight:700;font-size:13px;color:var(--hijau)">✅ ${esc(p.nama)}</div>
     <div style="font-size:11px;color:#888">${esc(p.jenis)}</div><div style="font-size:11px;color:var(--hijau-mid)">🎯 Target: ${rp(p.targetNominal||0)}</div>
-    <div style="font-size:11px;color:${p.nomorVA?'var(--hijau-mid)':'#e65100'}">${p.nomorVA?'🏦 VA BSI: '+esc(p.nomorVA):'⚠️ No. VA belum diassign'}</div></div></div>`;
+    <div style="font-size:11px;color:${effectiveVAStatus(p)==='active'?'var(--hijau-mid)':'#e65100'}">${p.nomorVA?'🏦 VA BSI: '+esc(p.nomorVA)+' · '+vaStatusLabel(effectiveVAStatus(p)):'⚠️ No. VA belum tersedia'}</div></div></div>`;
   el.style.display='block';
 }
 
@@ -735,6 +851,7 @@ window.inputSetoran=async function(){
   const tgl=document.getElementById('setor-tgl').value;
   const catatan=document.getElementById('setor-catatan').value.trim();
   if(!selPeserta||!currentParticipant||!auth.currentUser) return showAlert('alert-setor','error','Silakan masuk sebagai peserta terlebih dahulu.');
+  if(effectiveVAStatus(selPeserta)!=='active') return showAlert('alert-setor','warning','Virtual Account Anda belum aktif. Jangan melakukan transfer atau melaporkan setoran sebelum admin mengaktifkan VA.');
   if(!nominal||nominal<1000) return showAlert('alert-setor','error','Nominal minimal Rp 1.000.');
   if(!tgl) return showAlert('alert-setor','error','Tanggal wajib diisi.');
   setLoading('btn-setor',true);
@@ -744,10 +861,11 @@ window.inputSetoran=async function(){
     if(duplicate&&!confirm('Ada laporan setoran dengan tanggal dan nominal yang sama. Tetap kirim sebagai setoran baru?')){
       setLoading('btn-setor',false); return;
     }
-    const ref=await addDoc(collection(db,'setoran'),{
-      pesertaId:selPeserta.id,ownerUid:auth.currentUser.uid,nama:selPeserta.nama,hp:selPeserta.hp,
-      nomorVA:selPeserta.nomorVA||'',nominal,tgl,catatan,cara:'Transfer VA BSI',status:'pending',tglInput:serverTimestamp()
-    });
+    const ref=doc(collection(db,'setoran'));
+    const batch=writeBatch(db);
+    batch.set(ref,{pesertaId:selPeserta.id,ownerUid:auth.currentUser.uid,nama:selPeserta.nama,hp:selPeserta.hp,nomorVA:selPeserta.nomorVA||'',nominal,tgl,catatan,cara:'Transfer VA BSI',status:'pending',tglInput:serverTimestamp()});
+    batch.update(doc(db,'peserta',selPeserta.id),{pendingSetoran:increment(1)});
+    await batch.commit();
     await writeAudit('PARTICIPANT_SUBMIT_SETORAN','setoran',ref.id,{nominal,tgl});
     document.getElementById('setor-nominal').value='';
     document.getElementById('setor-catatan').value='';
@@ -843,33 +961,61 @@ window.kirimResetAdmin=async function(){
 };
 
 let allPeserta=[], allSetoran=[];
-let adminFilter='all', adminSort='nama', adminView='list', detailId=null;
+let adminFilter='all', adminSort='nama', adminSearch='', adminPage=1, adminView='list', detailId=null;
+const ADMIN_PAGE_SIZE=50;
+
+async function ensureParticipantSummaries(rows){
+  const missing=rows.filter(p=>p.saldoConfirmed===undefined||p.jumlahSetorConfirmed===undefined||p.pendingSetoran===undefined);
+  if(!missing.length)return false;
+  const snap=await getDocs(collection(db,'setoran'));
+  const tx=snap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted');
+  for(let i=0;i<missing.length;i+=350){
+    const batch=writeBatch(db);
+    missing.slice(i,i+350).forEach(p=>{
+      const own=tx.filter(x=>x.pesertaId===p.id);
+      const confirmed=own.filter(x=>x.status==='confirmed');
+      const pending=own.filter(x=>x.status==='pending');
+      const last=confirmed.slice().sort((a,b)=>(b.tglKonfirmasi?.seconds||b.tglInput?.seconds||0)-(a.tglKonfirmasi?.seconds||a.tglInput?.seconds||0))[0];
+      batch.update(doc(db,'peserta',p.id),{
+        saldoConfirmed:confirmed.reduce((a,x)=>a+Number(x.nominal||0),0),
+        jumlahSetorConfirmed:confirmed.length,
+        pendingSetoran:pending.length,
+        lastSetorAt:last?.tglKonfirmasi||last?.tglInput||null,
+        summaryMigratedAt:serverTimestamp()
+      });
+    });
+    await batch.commit();
+  }
+  await writeAudit('MIGRATE_PARTICIPANT_SUMMARY','peserta','batch',{jumlah:missing.length});
+  return true;
+}
 
 async function renderAdminPanel() {
   if(!currentAdmin) return;
   try {
-    const [pSnap,sSnap]=await Promise.all([getDocs(collection(db,'peserta')),getDocs(collection(db,'setoran'))]);
+    let pSnap=await getDocs(collection(db,'peserta'));
     allPeserta=pSnap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);
-    allSetoran=sSnap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted');
+    const migrated=await ensureParticipantSummaries(allPeserta);
+    if(migrated){pSnap=await getDocs(collection(db,'peserta'));allPeserta=pSnap.docs.map(d=>({id:d.id,...d.data()})).filter(p=>!p.deleted);}
+    const pendingSnap=await getDocs(query(collection(db,'setoran'),where('status','==','pending')));
+    allSetoran=pendingSnap.docs.map(d=>({id:d.id,...d.data()}));
     pesertaCache=[...allPeserta];
-    const pending=allSetoran.filter(x=>x.status==='pending');
-    const confirmed=allSetoran.filter(x=>x.status==='confirmed');
-    const belumVA=allPeserta.filter(p=>!p.nomorVA);
+    const pending=allSetoran;
+    const pendingVA=allPeserta.filter(p=>effectiveVAStatus(p)!=='active');
     document.getElementById('adm-peserta').textContent=allPeserta.length;
-    document.getElementById('adm-total').textContent=rp(confirmed.reduce((a,x)=>a+Number(x.nominal||0),0));
+    document.getElementById('adm-total').textContent=rp(allPeserta.reduce((a,p)=>a+Number(p.saldoConfirmed||0),0));
     document.getElementById('adm-pending-stat').textContent=pending.length;
-    await updateBadge();
+    const b=document.getElementById('badge-pending');b.textContent=pending.length;b.style.display=pending.length?'inline-block':'none';
+    updateVABadge(pendingVA.length);
     const warn=document.getElementById('adm-va-warn');
     const akunBelum=allPeserta.filter(p=>!p.authUid).length;
-    const msgs=[]; if(belumVA.length) msgs.push(`${belumVA.length} peserta belum punya No. VA`); if(akunBelum) msgs.push(`${akunBelum} peserta lama belum diaktifkan PIN`);
+    const msgs=[];if(pendingVA.length)msgs.push(`${pendingVA.length} VA menunggu aktivasi/review`);if(akunBelum)msgs.push(`${akunBelum} peserta lama belum diaktifkan PIN`);
     if(msgs.length){warn.textContent='⚠️ '+msgs.join(' · ');warn.style.display='block';}else warn.style.display='none';
-    if(currentAdmin.role==='superadmin'){
-      const est=await getSetting('estimasi',DEFAULT_ESTIMASI); document.getElementById('adm-estimasi').value=est;
-    }
+    if(currentAdmin.role==='superadmin'){const est=await getSetting('estimasi',DEFAULT_ESTIMASI);document.getElementById('adm-estimasi').value=est;}
     document.querySelectorAll('.superadmin-only').forEach(el=>el.style.display=currentAdmin.role==='superadmin'?'':'none');
     renderPendingList(pending);
-    if(adminView==='list') renderPesertaList();
-    await ensureParticipantRegistry();
+    renderVAActivationList();
+    if(adminView==='list')renderPesertaList();
     await syncPublicStats(false);
   } catch(e) { console.error(e); showAlert('alert-adm-panel','error','Gagal memuat panel: '+authMessage(e)); }
 }
@@ -882,10 +1028,40 @@ async function updateBadge() {
   catch{b.style.display='none';}
 }
 
-const getSaldoP  = id => allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed').reduce((a,s)=>a+s.nominal,0);
-const getJmlP    = id => allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed').length;
-const getLastP   = id => { const l=allSetoran.filter(s=>s.pesertaId===id&&s.status==='confirmed'); return l.length?l.sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0))[0].tglInput:null; };
-const hasPendP   = id => allSetoran.some(s=>s.pesertaId===id&&s.status==='pending');
+function updateVABadge(count){
+  const b=document.getElementById('badge-va-pending');if(!b)return;
+  b.textContent=count||0;b.style.display=count?'inline-block':'none';
+}
+function renderVAActivationList(){
+  const el=document.getElementById('adm-va-activation-list');if(!el)return;
+  const list=allPeserta.filter(p=>effectiveVAStatus(p)!=='active');
+  if(!list.length){el.innerHTML='<div class="empty-state"><div class="ei">✅</div><p>Semua Virtual Account sudah aktif.</p></div>';return;}
+  el.innerHTML=list.map(p=>{
+    const candidate=p.nomorVA||generateVA(p.hp);
+    return `<div class="va-activation-row"><div class="va-activation-head"><div><strong>${esc(p.nama)}</strong><div>📱 ${esc(p.hp)} · ${p.referralCode?'Referral '+esc(p.referralCode):'Non-referral'}</div></div><span class="badge ${effectiveVAStatus(p)==='review'?'badge-red':'badge-yellow'}">${effectiveVAStatus(p)==='review'?'Perlu Review':'Menunggu'}</span></div><label class="form-label">No. VA hasil BSI</label><input class="form-input" id="activate-va-${p.id}" value="${esc(candidate)}" inputmode="numeric"><div class="va-activation-actions"><button class="btn btn-primary btn-sm" onclick="approveVA('${p.id}')">✅ Approve & Aktifkan</button></div></div>`;
+  }).join('');
+}
+window.approveVA=async function(pid){
+  const p=allPeserta.find(x=>x.id===pid);if(!p)return;
+  const va=(document.getElementById('activate-va-'+pid)?.value||document.getElementById('va-inp-'+pid)?.value||'').replace(/\D/g,'');
+  if(!/^834576\d{10}$/.test(va))return showAlert('alert-adm-panel','error','No. VA harus berformat 834576 + 10 digit nomor peserta.');
+  try{
+    const reg=await getDoc(doc(db,'va_registry',va));
+    if(reg.exists()&&reg.data().participantId!==pid)throw new Error('No. VA sudah digunakan peserta lain. Edit sesuai data resmi BSI.');
+    const batch=writeBatch(db);
+    batch.set(doc(db,'va_registry',va),{nomorVA:va,participantId:pid,uid:p.authUid||'',status:'active',updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
+    if(p.nomorVA&&p.nomorVA!==va)batch.set(doc(db,'va_registry',p.nomorVA),{status:'replaced',replacedBy:va,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
+    batch.update(doc(db,'peserta',pid),{nomorVA:va,statusVA:'active',vaSource:p.vaSource||'admin',tglAktivasiVA:serverTimestamp(),aktivasiOleh:currentAdmin.nama});
+    await batch.commit();await writeAudit('ACTIVATE_VA','peserta',pid,{nomorVA:va});
+    showAlert('alert-adm-panel','success','No. VA berhasil diaktifkan.');await renderAdminPanel();
+  }catch(e){showAlert('alert-adm-panel','error','Gagal aktivasi VA: '+authMessage(e));}
+};
+
+const getPesertaById=id=>allPeserta.find(p=>p.id===id)||{};
+const getSaldoP=id=>Number(getPesertaById(id).saldoConfirmed||0);
+const getJmlP=id=>Number(getPesertaById(id).jumlahSetorConfirmed||0);
+const getLastP=id=>getPesertaById(id).lastSetorAt||null;
+const hasPendP=id=>Number(getPesertaById(id).pendingSetoran||0)>0;
 
 function renderPendingList(pending) {
   const el=document.getElementById('adm-pending-list');
@@ -901,40 +1077,43 @@ function renderPendingList(pending) {
 }
 
 function renderPesertaList() {
-  const el=document.getElementById('adm-peserta-list'); let list=[...allPeserta];
-  if(adminFilter==='va-belum') list=list.filter(p=>!p.nomorVA);
-  else if(adminFilter==='va-ok') list=list.filter(p=>!!p.nomorVA);
-  else if(adminFilter==='aktif') list=list.filter(p=>getSaldoP(p.id)>0);
-  else if(adminFilter==='belum') list=list.filter(p=>getSaldoP(p.id)===0);
-  else if(adminFilter==='akun-belum') list=list.filter(p=>!p.authUid);
-  if(adminSort==='saldo-desc') list.sort((a,b)=>getSaldoP(b.id)-getSaldoP(a.id));
-  else if(adminSort==='saldo-asc') list.sort((a,b)=>getSaldoP(a.id)-getSaldoP(b.id));
-  else if(adminSort==='pct-desc') list.sort((a,b)=>pct(getSaldoP(b.id),b.targetNominal||3500000)-pct(getSaldoP(a.id),a.targetNominal||3500000));
-  else if(adminSort==='nama') list.sort((a,b)=>a.nama.localeCompare(b.nama));
-  else if(adminSort==='terbaru') list.sort((a,b)=>(b.tglDaftar?.seconds||0)-(a.tglDaftar?.seconds||0));
-  if(!list.length){el.innerHTML='<div class="empty-state"><div class="ei">🔍</div><p>Tidak ada peserta dengan filter ini</p></div>';return;}
-  el.innerHTML=list.map(p=>{
+  const el=document.getElementById('adm-peserta-list');let list=[...allPeserta];
+  if(adminFilter==='va-belum')list=list.filter(p=>effectiveVAStatus(p)!=='active');
+  else if(adminFilter==='va-ok')list=list.filter(p=>effectiveVAStatus(p)==='active');
+  else if(adminFilter==='aktif')list=list.filter(p=>getSaldoP(p.id)>0);
+  else if(adminFilter==='belum')list=list.filter(p=>getSaldoP(p.id)===0);
+  else if(adminFilter==='akun-belum')list=list.filter(p=>!p.authUid);
+  const q=adminSearch.trim().toLowerCase().replace(/\s+/g,' ');
+  if(q)list=list.filter(p=>[p.nama,p.hp,p.nomorVA,p.referralCode,p.referralLabel].filter(Boolean).join(' ').toLowerCase().includes(q));
+  if(adminSort==='saldo-desc')list.sort((a,b)=>getSaldoP(b.id)-getSaldoP(a.id));
+  else if(adminSort==='saldo-asc')list.sort((a,b)=>getSaldoP(a.id)-getSaldoP(b.id));
+  else if(adminSort==='pct-desc')list.sort((a,b)=>pct(getSaldoP(b.id),b.targetNominal||3500000)-pct(getSaldoP(a.id),a.targetNominal||3500000));
+  else if(adminSort==='nama')list.sort((a,b)=>a.nama.localeCompare(b.nama));
+  else if(adminSort==='terbaru')list.sort((a,b)=>(b.tglDaftar?.seconds||0)-(a.tglDaftar?.seconds||0));
+  const pagination=document.getElementById('adm-peserta-pagination');
+  if(!list.length){el.innerHTML='<div class="empty-state"><div class="ei">🔍</div><p>Peserta tidak ditemukan. Periksa kata pencarian atau filter yang digunakan.</p></div>';if(pagination)pagination.innerHTML='';return;}
+  const totalPages=Math.max(1,Math.ceil(list.length/ADMIN_PAGE_SIZE));adminPage=Math.min(adminPage,totalPages);
+  const pageRows=list.slice((adminPage-1)*ADMIN_PAGE_SIZE,adminPage*ADMIN_PAGE_SIZE);
+  el.innerHTML=pageRows.map(p=>{
     const saldo=getSaldoP(p.id),targetP=p.targetNominal||3500000,pc2=pct(saldo,targetP),jml=getJmlP(p.id),last=getLastP(p.id),pend=hasPendP(p.id);
-    const vaBadge=p.nomorVA?`<span class="badge badge-green">🏦 ${esc(p.nomorVA)}</span>`:'<span class="badge badge-red">⚠️ Belum VA</span>';
+    const vaBadge=effectiveVAStatus(p)==='active'?`<span class="badge badge-green">🏦 ${esc(p.nomorVA)}</span>`:p.nomorVA?`<span class="badge badge-yellow">⏳ VA ${esc(p.nomorVA)}</span>`:'<span class="badge badge-red">⚠️ Review VA</span>';
     const authBadge=p.authUid?'<span class="badge badge-green">🔐 PIN aktif</span>':'<span class="badge badge-yellow">🔓 Belum PIN</span>';
-    return `<div class="peserta-card" onclick="showDetail('${p.id}')"><div class="pc-top"><div class="avatar">${esc(p.nama.charAt(0).toUpperCase())}</div>
-      <div style="flex:1;min-width:0"><div class="p-nama">${esc(p.nama)} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div>
-      <a class="participant-wa-link" href="${participantWaUrl(p)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Chat peserta melalui WhatsApp">📱 ${esc(p.hp)} · Chat WA</a>
-      <div class="p-sub">🎯 Target: ${rp(targetP)}</div><div style="margin-top:3px">${vaBadge} ${authBadge}</div></div>
-      <div style="text-align:right;flex-shrink:0"><div class="p-saldo">${rp(saldo)}</div><div class="p-pct">${pc2}%</div></div></div>
-      <div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa"><span>${jml}x setor</span><span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span></div>
-      <div style="text-align:right;margin-top:5px;font-size:11px;color:var(--emas)">Tap untuk detail →</div></div>`;
+    const refBadge=p.referralCode?`<span class="badge badge-blue">🔗 ${esc(p.referralCode)}</span>`:'<span class="badge badge-gray">Organik</span>';
+    return `<div class="peserta-card" onclick="showDetail('${p.id}')"><div class="pc-top"><div class="avatar">${esc(p.nama.charAt(0).toUpperCase())}</div><div style="flex:1;min-width:0"><div class="p-nama">${esc(p.nama)} ${pend?'<span class="badge badge-yellow">⏳</span>':''}</div><a class="participant-wa-link" href="${participantWaUrl(p)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Chat peserta melalui WhatsApp">📱 ${esc(p.hp)} · Chat WA</a><div class="p-sub">🎯 Target: ${rp(targetP)}</div><div style="margin-top:3px">${vaBadge} ${authBadge} ${refBadge}</div></div><div style="text-align:right;flex-shrink:0"><div class="p-saldo">${rp(saldo)}</div><div class="p-pct">${pc2}%</div></div></div><div class="mini-bar" style="margin-top:6px"><div class="mini-fill" style="width:${pc2}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:#aaa"><span>${jml}x setor</span><span>${last?'Terakhir: '+tglFmt(last):'⚠️ Belum setor'}</span></div><div style="text-align:right;margin-top:5px;font-size:11px;color:var(--emas)">Tap untuk detail →</div></div>`;
   }).join('');
+  if(pagination)pagination.innerHTML=`<button class="btn btn-outline btn-sm" ${adminPage<=1?'disabled':''} onclick="setAdminPage(${adminPage-1})">←</button><span>Halaman ${adminPage} dari ${totalPages} · ${list.length} peserta</span><button class="btn btn-outline btn-sm" ${adminPage>=totalPages?'disabled':''} onclick="setAdminPage(${adminPage+1})">→</button>`;
 }
 
-window.setFilter = f => { adminFilter=f; document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===f)); renderPesertaList(); };
-window.setSort   = s => { adminSort=s; renderPesertaList(); };
+window.setFilter = f => { adminFilter=f;adminPage=1;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===f));renderPesertaList(); };
+window.setSort=s=>{adminSort=s;adminPage=1;renderPesertaList();};
+window.setAdminSearch=value=>{adminSearch=value||'';adminPage=1;renderPesertaList();};
+window.setAdminPage=page=>{adminPage=Math.max(1,page);renderPesertaList();document.getElementById('adm-list-view')?.scrollIntoView({behavior:'smooth'});};
 
-window.showDetail = function(id) {
+window.showDetail = async function(id) {
   detailId=id; adminView='detail';
   document.getElementById('adm-list-view').style.display='none';
   document.getElementById('adm-detail').style.display='block';
-  renderDetail();
+  await renderDetail();
 };
 window.backToList = function() {
   adminView='list'; detailId=null;
@@ -942,9 +1121,11 @@ window.backToList = function() {
   document.getElementById('adm-list-view').style.display='block';
 };
 
-function renderDetail() {
-  const p=allPeserta.find(x=>x.id===detailId); if(!p)return;
-  const setoranP=allSetoran.filter(x=>x.pesertaId===p.id).sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
+async function renderDetail() {
+  const p=allPeserta.find(x=>x.id===detailId);if(!p)return;
+  const box=document.getElementById('detail-content');box.innerHTML='<div class="empty-state"><div class="ei">⏳</div><p>Memuat detail peserta...</p></div>';
+  const snap=await getDocs(query(collection(db,'setoran'),where('pesertaId','==',p.id)));
+  const setoranP=snap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted').sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
   const confirmed=setoranP.filter(x=>x.status==='confirmed'),pending=setoranP.filter(x=>x.status==='pending');
   const saldo=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0),targetP=p.targetNominal||3500000,pc=pct(saldo,targetP);
   document.getElementById('detail-content').innerHTML=`
@@ -958,8 +1139,7 @@ function renderDetail() {
       <button class="btn btn-primary" onclick="aktifkanPinPeserta('${p.id}')" style="margin-top:8px">${p.authUid?'🔄 Reset PIN Peserta':'🔐 Aktifkan PIN Peserta'}</button>
       <div style="font-size:10px;color:#888;margin-top:6px">PIN tidak disimpan di Firestore. Sampaikan PIN kepada peserta melalui jalur pribadi.</div></div>
     <div class="card" style="border:${p.nomorVA?'1px solid rgba(201,168,76,.2)':'2px solid #e53935'}"><div class="card-title">🏦 Virtual Account BSI</div>
-      ${p.nomorVA?`<div class="va-assigned"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI</div><div class="va-assigned-num">${esc(p.nomorVA)}</div></div><div style="display:flex;gap:8px;margin-top:8px"><input type="text" class="form-input" id="va-inp-${p.id}" value="${esc(p.nomorVA)}" style="font-size:13px"><button class="btn btn-outline btn-sm" onclick="simpanVA('${p.id}')">Ubah</button></div>`:
-      `<div style="background:#fde8e8;border-radius:10px;padding:12px;margin-bottom:12px;font-size:12px;color:#c62828">⚠️ Belum ada No. VA. Input sekarang.</div><div class="form-group"><label class="form-label">Input No. VA BSI</label><input type="text" class="form-input" id="va-inp-${p.id}" placeholder="Contoh: 8809012345678"></div><button class="btn btn-primary" onclick="simpanVA('${p.id}')">💾 Simpan No. VA</button>`}</div>
+      <div class="va-assigned" style="border-color:${effectiveVAStatus(p)==='active'?'#4caf50':'#ff9800'}"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI · ${vaStatusLabel(effectiveVAStatus(p))}</div><div class="va-assigned-num">${esc(p.nomorVA||generateVA(p.hp)||'-')}</div></div><div style="display:flex;gap:8px;margin-top:8px"><input type="text" class="form-input" id="va-inp-${p.id}" value="${esc(p.nomorVA||generateVA(p.hp))}" style="font-size:13px"><button class="btn btn-primary btn-sm" onclick="approveVA('${p.id}')">Approve & Aktifkan</button></div></div>
     <div class="card"><div class="card-title">🎯 Ubah Target Nominal</div><div style="display:flex;gap:8px"><div style="flex:1;position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--hijau);font-weight:700">Rp</span><input type="number" class="form-input" id="target-inp-${p.id}" value="${targetP}" style="padding-left:36px;font-size:13px"></div><button class="btn btn-outline btn-sm" onclick="simpanTargetPeserta('${p.id}')">Simpan</button></div></div>
     ${pending.length?`<div class="pending-notice" style="display:block;margin-bottom:12px">⏳ ${pending.length} setoran pending (${rp(pending.reduce((a,x)=>a+x.nominal,0))})</div>`:''}
     <div class="card"><div class="card-title">📋 Riwayat Setoran</div>${setoranP.length?setoranP.map(x=>{const badge=x.status==='confirmed'?'<span class="badge badge-green">✅</span>':x.status==='rejected'?'<span class="badge badge-red">❌</span>':'<span class="badge badge-yellow">⏳</span>';return `<div class="s-detail-item"><div><div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(x.nominal)} ${badge}</div><div style="font-size:11px;color:#888">${tglFull(x.tglInput)} · Transfer VA BSI</div>${x.catatan?`<div style="font-size:11px;color:#888">📝 ${esc(x.catatan)}</div>`:''}${x.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${esc(x.rekonNama)} · ${esc(x.rekonWaktu||'')}</div>`:''}${x.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>${x.status==='pending'?`<div class="rekon-box" style="margin-top:8px"><input type="text" class="form-input" id="rn-${x.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rw-${x.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rt-${x.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px"><div style="display:flex;gap:8px"><button class="btn-confirm" onclick="konfirmasi('${x.id}',true)">✅ Dana Masuk</button><button class="btn-reject" onclick="konfirmasi('${x.id}',false)">❌ Tolak</button></div></div>`:''}</div>`}).join(''):'<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}</div>
@@ -977,7 +1157,8 @@ window.hapusPeserta=async function(pid){
     if(p.authUid) main.set(doc(db,'users',p.authUid),{active:false,disabledAt:serverTimestamp(),disabledBy:currentAdmin.uid},{merge:true});
     main.set(doc(db,'login_lookup',p.hp),{active:false,deleted:true,updatedAt:serverTimestamp()},{merge:true});
     await main.commit();
-    const rows=allSetoran.filter(x=>x.pesertaId===pid);
+    const rowsSnap=await getDocs(query(collection(db,'setoran'),where('pesertaId','==',pid)));
+    const rows=rowsSnap.docs.map(d=>({id:d.id,...d.data()}));
     for(let i=0;i<rows.length;i+=400){const batch=writeBatch(db);rows.slice(i,i+400).forEach(x=>batch.update(doc(db,'setoran',x.id),{status:'deleted',deletedAt:serverTimestamp()}));await batch.commit();}
     await writeAudit('DELETE_PARTICIPANT','peserta',pid,{nama:p.nama});
     backToList(); await renderAdminPanel();
@@ -985,11 +1166,7 @@ window.hapusPeserta=async function(pid){
   }catch(e){alert('Gagal menghapus: '+authMessage(e));}
 };
 
-window.simpanVA=async function(pid){
-  const va=document.getElementById('va-inp-'+pid)?.value.trim(); if(!va)return alert('Nomor VA tidak boleh kosong.');
-  try{await updateDoc(doc(db,'peserta',pid),{nomorVA:va,assignOleh:currentAdmin.nama,tglVA:serverTimestamp()});await writeAudit('UPDATE_VA','peserta',pid,{nomorVA:va});await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel','success','✅ No. VA berhasil disimpan.');}
-  catch(e){alert('Gagal: '+authMessage(e));}
-};
+window.simpanVA=async function(pid){return approveVA(pid);};
 
 window.simpanTargetPeserta=async function(pid){
   const v=parseInt(document.getElementById('target-inp-'+pid)?.value);if(!v||v<100000)return alert('Target minimal Rp 100.000.');
@@ -1001,8 +1178,10 @@ window.konfirmasi=async function(sid,approve){
   const alasan=document.getElementById('rt-'+sid)?.value.trim(),rekonNama=document.getElementById('rn-'+sid)?.value.trim(),rekonWaktu=document.getElementById('rw-'+sid)?.value.trim();
   if(!approve&&!alasan&&!confirm('Tolak tanpa alasan?'))return;
   const srow=allSetoran.find(x=>x.id===sid); const p=allPeserta.find(x=>x.id===srow?.pesertaId);
-  try{await updateDoc(doc(db,'setoran',sid),{status:approve?'confirmed':'rejected',tglKonfirmasi:serverTimestamp(),konfirmasiOleh:currentAdmin.nama,
-    ...(p?.authUid?{ownerUid:p.authUid}:{}),...(alasan&&{alasanTolak:alasan}),...(rekonNama&&{rekonNama}),...(rekonWaktu&&{rekonWaktu})});
+  try{const batch=writeBatch(db);
+    batch.update(doc(db,'setoran',sid),{status:approve?'confirmed':'rejected',tglKonfirmasi:serverTimestamp(),konfirmasiOleh:currentAdmin.nama,...(p?.authUid?{ownerUid:p.authUid}:{}),...(alasan&&{alasanTolak:alasan}),...(rekonNama&&{rekonNama}),...(rekonWaktu&&{rekonWaktu})});
+    batch.update(doc(db,'peserta',srow.pesertaId),approve?{saldoConfirmed:increment(Number(srow.nominal||0)),jumlahSetorConfirmed:increment(1),pendingSetoran:increment(-1),lastSetorAt:serverTimestamp()}:{pendingSetoran:increment(-1)});
+    await batch.commit();
     await writeAudit(approve?'CONFIRM_SETORAN':'REJECT_SETORAN','setoran',sid,{nominal:srow?.nominal||0,pesertaId:srow?.pesertaId||'',alasan:alasan||''});
     await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel',approve?'success':'error',approve?'✅ Setoran dikonfirmasi!':'❌ Setoran ditolak.');}
   catch(e){showAlert('alert-adm-panel','error','Gagal: '+authMessage(e));}
@@ -1023,7 +1202,8 @@ window.aktifkanPinPeserta=async function(pid){
     batch.set(doc(db,'login_lookup',p.hp),{hp:p.hp,uid:newUid,participantId:p.id,loginEmail,active:true,registered:true,updatedAt:serverTimestamp()},{merge:true});
     if(p.authUid)batch.set(doc(db,'users',p.authUid),{active:false,replacedBy:newUid,disabledAt:serverTimestamp()},{merge:true});
     await batch.commit();
-    const rows=allSetoran.filter(x=>x.pesertaId===p.id);
+    const rowsSnap=await getDocs(query(collection(db,'setoran'),where('pesertaId','==',p.id)));
+    const rows=rowsSnap.docs.map(d=>({id:d.id,...d.data()}));
     for(let i=0;i<rows.length;i+=400){const b=writeBatch(db);rows.slice(i,i+400).forEach(x=>b.update(doc(db,'setoran',x.id),{ownerUid:newUid}));await b.commit();}
     await signOut(helperAuth);
     await writeAudit(p.authUid?'RESET_PARTICIPANT_PIN':'ACTIVATE_PARTICIPANT_PIN','peserta',p.id,{newUid,migratedSetoran:rows.length});
@@ -1043,18 +1223,9 @@ async function ensureParticipantRegistry(){
 
 async function syncPublicStats(logAction=true){
   if(!currentAdmin)return;
-  const confirmed=allSetoran.filter(x=>x.status==='confirmed');
-  const totalDana=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0);
+  const totalDana=allPeserta.reduce((a,p)=>a+Number(p.saldoConfirmed||0),0);
   const totalTarget=allPeserta.reduce((a,p)=>a+Number(p.targetNominal||0),0);
-  const items=allPeserta.map(p=>{
-    const rows=confirmed.filter(x=>x.pesertaId===p.id);
-    const saldo=rows.reduce((a,x)=>a+Number(x.nominal||0),0);
-    const firstSetorMs=rows.length?Math.min(...rows.map(x=>x.tglInput?.toMillis?.() || Number(x.tglInput?.seconds||0)*1000 || Number.MAX_SAFE_INTEGER)):Number.MAX_SAFE_INTEGER;
-    return{namaMasked:maskName(p.nama),jenis:p.jenis||'',saldo,target:p.targetNominal||0,progress:pct(saldo,p.targetNominal||3500000),firstSetorMs};
-  }).filter(x=>x.saldo>0)
-    .sort((a,b)=>b.saldo-a.saldo || b.progress-a.progress || a.firstSetorMs-b.firstSetorMs)
-    .slice(0,5)
-    .map(({firstSetorMs,...item})=>item);
+  const items=allPeserta.map(p=>{const saldo=Number(p.saldoConfirmed||0);const firstSetorMs=p.lastSetorAt?.toMillis?.()||Number(p.lastSetorAt?.seconds||0)*1000||Number.MAX_SAFE_INTEGER;return{namaMasked:maskName(p.nama),jenis:p.jenis||'',saldo,target:p.targetNominal||0,progress:pct(saldo,p.targetNominal||3500000),firstSetorMs};}).filter(x=>x.saldo>0).sort((a,b)=>b.saldo-a.saldo||b.progress-a.progress||a.firstSetorMs-b.firstSetorMs).slice(0,5).map(({firstSetorMs,...item})=>item);
   const batch=writeBatch(db);
   batch.set(doc(db,'public_stats','overview'),{totalPeserta:allPeserta.length,totalDana,totalTarget,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
   batch.set(doc(db,'leaderboard_public','top5'),{items,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});
@@ -1258,7 +1429,8 @@ window.showAdmTab=function(tab,btn){
   document.querySelectorAll('.adm-tab-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('adm-tab-'+tab).style.display='block';btn.classList.add('active');
   if(tab==='peserta')renderPesertaList();
-  if(tab==='setting'){loadSKEditor();loadPaketSetting();loadKontakEditor();}
+  if(tab==='va-activation')renderVAActivationList();
+  if(tab==='setting'){loadSKEditor();loadPaketSetting();loadKontakEditor();loadReferralCodes();}
   if(tab==='rekap')renderRekap();
   if(tab==='security')renderAdminUsers();
   if(tab==='audit')renderAuditLog();
@@ -1297,7 +1469,7 @@ function renderRekap() {
   allPeserta.forEach(p => {
     const j = (p.jenis||'').toLowerCase();
     const t = p.targetNominal || 0;
-    const saldo = allSetoran.filter(s=>s.pesertaId===p.id && s.status==='confirmed').reduce((a,s)=>a+s.nominal,0);
+    const saldo=Number(p.saldoConfirmed||0);
     const item = { nama:p.nama, hp:p.hp, jenis:p.jenis||'-', target:t, saldo };
     if (j.includes('sapi')) kategori.sapi.push(item);
     else if (j.includes('custom') || j.includes('Custom')) kategori.custom.push(item);
@@ -1390,22 +1562,22 @@ window.exportCSV = async function() {
 // Export rekap semua PESERTA (saldo terupdate)
 window.exportSemuaPeserta = function() {
   if (!allPeserta.length) return alert('Belum ada data peserta.');
-  let csv = 'No,Nama,No HP,No VA BSI,Alamat,Paket Nabung,Target Nominal,Total Setoran,Jumlah Setor,Progress (%),Status VA,Tgl Daftar\n';
+  let csv = 'No,Nama,No HP,No VA BSI,Status VA,Kode Referral,Sumber Referral,Alamat,Paket Nabung,Target Nominal,Total Setoran,Jumlah Setor,Progress (%),Tgl Daftar\n';
   const sorted = [...allPeserta].sort((a,b)=>a.nama.localeCompare(b.nama));
   sorted.forEach((p, i) => {
-    const confirmed = allSetoran.filter(s=>s.pesertaId===p.id&&s.status==='confirmed');
-    const totalSetor = confirmed.reduce((a,s)=>a+s.nominal,0);
-    const jmlSetor   = confirmed.length;
+    const totalSetor=Number(p.saldoConfirmed||0);
+    const jmlSetor=Number(p.jumlahSetorConfirmed||0);
     const progress   = p.targetNominal ? Math.round(totalSetor/p.targetNominal*100) : 0;
-    const statusVA   = p.nomorVA ? 'Sudah VA' : 'Belum VA';
-    csv += `"${i+1}","${p.nama}","${p.hp}","${p.nomorVA||'-'}","${p.alamat||'-'}","${p.jenis||''}","${p.targetNominal||0}","${totalSetor}","${jmlSetor}","${progress}%","${statusVA}","${tglFmt(p.tglDaftar)}"\n`;
+    const statusVA=vaStatusLabel(effectiveVAStatus(p));
+    csv += `"${i+1}","${p.nama}","${p.hp}","${p.nomorVA||'-'}","${statusVA}","${p.referralCode||'-'}","${p.referralLabel||'-'}","${p.alamat||'-'}","${p.jenis||''}","${p.targetNominal||0}","${totalSetor}","${jmlSetor}","${progress}%","${tglFmt(p.tglDaftar)}"\n`;
   });
   dlCSV(csv, 'rekap-peserta-taqur.csv');
 };
 
-window.exportPesertaCSV = function(pid) {
-  const p    = allPeserta.find(x=>x.id===pid);
-  const list = allSetoran.filter(s=>s.pesertaId===pid&&s.status==='confirmed');
+window.exportPesertaCSV=async function(pid){
+  const p=allPeserta.find(x=>x.id===pid);
+  const snap=await getDocs(query(collection(db,'setoran'),where('pesertaId','==',pid)));
+  const list=snap.docs.map(d=>d.data()).filter(s=>s.status==='confirmed');
   let csv = `TaQur — ${p?.nama||''}\nNo HP: ${p?.hp||''}\nNo VA BSI: ${p?.nomorVA||'-'}\nPaket: ${p?.jenis||''}\nTarget: ${rp(p?.targetNominal||0)}\n\nTanggal,Nominal,Nama Mutasi,Waktu Mutasi,Catatan\n`;
   list.forEach(s=>{ csv+=`"${tglFmt(s.tglInput)}","${s.nominal}","${s.rekonNama||''}","${s.rekonWaktu||''}","${s.catatan||''}"\n`; });
   csv+=`\nTotal Saldo,${list.reduce((a,s)=>a+s.nominal,0)}\nTarget,${p?.targetNominal||0}\n`;
@@ -1419,7 +1591,7 @@ function dlCSV(csv, fn) {
 }
 
 // INIT
-loadDashboard();
+startDashboardRealtime();
 renderKontakDynamic();
 document.getElementById('setor-tgl').value=new Date().toISOString().split('T')[0];
 
@@ -1701,6 +1873,23 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .sk-sub li{margin-bottom:4px;}
 .modal-footer{padding:14px 18px;border-top:1px solid var(--krem-dark);display:flex;gap:8px;}
 .modal-footer .btn{flex:1;}
+
+.app-popup-overlay{position:fixed;inset:0;background:rgba(8,24,17,.62);z-index:99999;display:none;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(3px)}
+.app-popup-overlay.open{display:flex}
+.app-popup-card{width:min(390px,100%);background:#fff;border-radius:18px;padding:22px;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,.28);border-top:5px solid var(--emas);animation:popupIn .18s ease}
+@keyframes popupIn{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
+.app-popup-icon{font-size:38px;margin-bottom:8px}.app-popup-title{font-family:'Amiri',serif;font-size:22px;font-weight:700;color:var(--hijau);margin-bottom:6px}.app-popup-message{font-size:13px;line-height:1.65;color:#444;white-space:pre-line;margin-bottom:16px}
+.organizer-card{background:#fff;border:1px solid var(--krem-dark);border-radius:15px;padding:18px;margin-top:12px;text-align:center;box-shadow:0 2px 10px rgba(26,74,46,.07)}
+.organizer-eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:1.6px;color:#888;margin-bottom:10px}.organizer-logo{display:block;max-width:330px;width:78%;height:auto;margin:0 auto 12px}.organizer-office{font-size:11.5px;line-height:1.65;color:#555}.organizer-office strong{font-size:13px;color:var(--hijau)}
+.referral-status{font-size:11px;color:#888;margin-top:5px}.referral-status.valid{color:#2e7d32;font-weight:700}.referral-status.invalid{color:#c62828;font-weight:700}.referral-status.checking{color:#8b6914}
+.admin-search-wrap{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--krem-dark);border-radius:12px;padding:6px 10px;margin-bottom:10px}.admin-search-wrap .form-input{border:none;padding:7px 2px;background:transparent;box-shadow:none}
+.badge-blue{background:#e8eaf6;color:#3949ab}.badge-gray{background:#eeeeee;color:#666}
+.va-status{display:inline-block;border-radius:99px;padding:5px 10px;font-size:11px;font-weight:700;margin:0 auto 10px}.va-status.pending{background:#fff3e0;color:#e65100}.va-status.active{background:#e8f5e9;color:#2e7d32}
+.va-alert-critical{background:#ffebee;border-left:4px solid #d32f2f;border-radius:10px;padding:12px;margin-top:10px;color:#b71c1c;font-size:12px;line-height:1.55}
+.va-transfer-note{background:#fff8e1;border:1px solid #f0cf72;border-radius:10px;padding:12px;margin-top:10px;color:#6d5200;font-size:12px;line-height:1.55}
+.va-activation-row{background:#fff;border:1px solid var(--krem-dark);border-radius:12px;padding:12px;margin-bottom:10px}.va-activation-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px;font-size:11px;color:#777}.va-activation-head strong{display:block;color:var(--hijau);font-size:14px;margin-bottom:2px}.va-activation-actions{display:flex;gap:8px;margin-top:8px}.inline-badge{position:static;transform:none;display:none;margin-left:3px;vertical-align:middle}
+.referral-admin-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px dashed var(--krem-dark);font-size:11px;color:#777}.referral-admin-row strong{display:block;color:var(--hijau);font-size:13px}.admin-pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin:12px 0;font-size:11px;color:#666}.admin-pagination button:disabled{opacity:.35;cursor:not-allowed}
+
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
 </style>
@@ -1708,20 +1897,6 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 <body>
 
 <div class="header">
-  <div class="ticker-wrap">
-    <div class="ticker-track" id="ticker-track">
-      <span class="ticker-item">BAITUL MAAL KHATULISTIWA SIDOARJO</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">POSKU AL-FATIH SIDOARJO</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">JAZZAAR AL-FATIH</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">AR-RA'I FARM — Amanah, Sehat, Berkualitas</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">TAQUR : TABUNG QURBAN AR RA'I FARM</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">BAITUL MAAL KHATULISTIWA SIDOARJO</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">POSKU AL-FATIH SIDOARJO</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">JAZZAAR AL-FATIH</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">AR-RA'I FARM — Amanah, Sehat, Berkualitas</span><span class="ticker-sep">✦</span>
-      <span class="ticker-item">TAQUR : TABUNG QURBAN AR RA'I FARM</span><span class="ticker-sep">✦</span>
-    </div>
-  </div>
   <div class="header-inner" role="img" aria-label="TaQur — Tabungan Qurban Ar-Ra'i Farm">
     <span class="header-brand-sr">TaQur — Tabungan Qurban Ar-Ra'i Farm. Amanah, sehat, dan berkualitas.</span>
   </div>
@@ -1778,6 +1953,11 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="ayat-text">"Dan dirikanlah shalat karena Tuhanmu; dan berqurbanlah."</div>
     <div class="ayat-source">— QS. Al-Kautsar: 2</div>
   </div>
+  <div class="organizer-card">
+    <div class="organizer-eyebrow">Diselenggarakan oleh</div>
+    <img class="organizer-logo" src="data:image/webp;base64,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" alt="Baitul Maal Khatulistiwa Jawa Timur">
+    <div class="organizer-office"><strong>Lokasi Kantor TaQur</strong><br>Jl. Raya Waru Indah No. 53, Wedoro, Kecamatan Waru,<br>Kabupaten Sidoarjo, Jawa Timur 61256</div>
+  </div>
 </div>
 
 <!-- DAFTAR -->
@@ -1790,6 +1970,11 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       <label class="form-label">No. WhatsApp * <span style="font-size:10px;color:var(--emas);font-weight:400">(kode unik Anda)</span></label>
       <input type="tel" class="form-input" id="daftar-hp" placeholder="08xx-xxxx-xxxx">
       <div style="font-size:11px;color:#888;margin-top:4px">📌 No. HP dipakai sebagai ID login peserta. Pastikan benar.</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Kode Referral <span style="font-size:10px;color:#888;font-weight:400">(opsional)</span></label>
+      <input type="text" class="form-input" id="daftar-referral" placeholder="Contoh: BMK001" maxlength="24" oninput="this.value=normalizeReferralCode(this.value)" onblur="cekKodeReferral()">
+      <div id="referral-status" class="referral-status">Jika diisi, kode wajib valid. Jika tidak punya, kosongkan kolom ini.</div>
     </div>
     <div class="form-group">
       <label class="form-label">Buat PIN Peserta (6 digit) *</label>
@@ -1872,7 +2057,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="si">🎉</div>
     <h3>Pendaftaran Berhasil!</h3>
     <p>Selamat bergabung dalam program TaQur Ar-Ra'i Farm.<br>Semoga Allah meridhoi niat qurban Anda.</p>
-    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Gunakan <strong>No. HP + PIN</strong> sekali per sesi untuk membuka saldo, VA, dan melaporkan setoran. Hubungi Admin TaQur untuk mendapatkan <strong>Nomor Virtual Account BSI</strong>.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Aynur.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Chandra.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
+    <div class="sukses-note"><strong>🏦 Langkah Selanjutnya:</strong><br><br>Gunakan <strong>No. HP + PIN</strong> sekali per sesi untuk membuka saldo, VA, dan melaporkan setoran. Nomor Virtual Account BSI dibuat otomatis dan akan aktif setelah dikonfirmasi admin/BSI. Jangan transfer sebelum status VA menjadi <strong>Aktif</strong>.<br><br><div id="kontak-sukses-dynamic"><a href="https://wa.me/6282139691445?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Aynur.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block;margin-bottom:4px">📞 Aynur: +62 821-3969-1445</a><a href="https://wa.me/6285733844255?text=%2A%5BPENGUNJUNG%20TAQUR%5D%2A%0AAssalamu%27alaikum%20Admin%20Chandra.%20Saya%20menghubungi%20melalui%20aplikasi%20TaQur%20Ar-Ra%27i%20Farm.%0ANama%3A%20%0AStatus%3A%20calon%20peserta%20/%20belum%20login%0A%0ASaya%20ingin%20menanyakan%20terkait%3A%0A" target="_blank" style="color:#f5e6a3;font-weight:700;text-decoration:none;display:block">📞 Chandra: +62 857-3384-4255</a></div></div>
   </div>
   <div class="ayat-box" style="margin-top:12px">
     <div class="ayat-text">"Tidak ada amalan anak Adam pada hari Nahr yang lebih dicintai Allah selain menyembelih hewan qurban."</div>
@@ -1943,6 +2128,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     <div class="adm-tabs">
       <button class="adm-tab-btn active" onclick="showAdmTab('pending',this)">⏳ Pending</button>
       <button class="adm-tab-btn" onclick="showAdmTab('peserta',this)">👥 Peserta</button>
+      <button class="adm-tab-btn" onclick="showAdmTab('va-activation',this)">🏦 Aktivasi VA <span class="nbadge inline-badge" id="badge-va-pending">0</span></button>
       <button class="adm-tab-btn" onclick="showAdmTab('rekap',this)">📊 Rekap</button>
       <button class="adm-tab-btn superadmin-only" onclick="showAdmTab('setting',this)">⚙️ Setting</button>
       <button class="adm-tab-btn superadmin-only" onclick="showAdmTab('security',this)">🔐 Keamanan</button>
@@ -1954,6 +2140,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
     </div>
     <div id="adm-tab-peserta" style="display:none">
       <div id="adm-list-view">
+        <div class="admin-search-wrap"><span>🔍</span><input type="search" class="form-input" placeholder="Cari nama, nomor HP, VA, atau kode referral..." oninput="setAdminSearch(this.value)"></div>
         <div class="filter-chips">
           <button class="filter-btn active" data-filter="all"      onclick="setFilter('all')">Semua</button>
           <button class="filter-btn" data-filter="va-belum"        onclick="setFilter('va-belum')">⚠️ Belum VA</button>
@@ -1972,12 +2159,15 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
             <option value="terbaru">Daftar Terbaru</option>
           </select>
         </div>
-        <div id="adm-peserta-list"></div>
+        <div id="adm-peserta-list"></div><div id="adm-peserta-pagination" class="admin-pagination"></div>
       </div>
       <div id="adm-detail" style="display:none">
         <div class="detail-back" onclick="backToList()">← Kembali</div>
         <div id="detail-content"></div>
       </div>
+    </div>
+    <div id="adm-tab-va-activation" style="display:none">
+      <div class="card"><div class="card-title">🏦 Aktivasi Virtual Account BSI</div><p style="font-size:12px;color:#666;margin-bottom:10px">Nomor dibuat otomatis dari pola 834576 + 10 digit nomor HP setelah 62. Cocokkan dengan data BSI, edit jika diperlukan, lalu aktifkan.</p><div id="adm-va-activation-list"></div></div>
     </div>
     <div id="adm-tab-rekap" style="display:none">
       <div id="rekap-content">
@@ -1985,6 +2175,14 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       </div>
     </div>
     <div id="adm-tab-setting" style="display:none">
+      <div class="card" style="border:2px solid #7b5ea7">
+        <div class="card-title">🔗 Kode Referral</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Buat kode untuk membedakan peserta referral dan peserta organik.</p>
+        <div class="alert" id="alert-referral-admin"></div>
+        <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:8px"><input class="form-input" id="referral-admin-code" placeholder="Kode: BMK001" oninput="this.value=normalizeReferralCode(this.value)"><input class="form-input" id="referral-admin-label" placeholder="Nama sumber/referral"></div>
+        <button class="btn btn-primary" onclick="buatKodeReferral()" style="margin-top:8px">➕ Buat Kode Referral</button>
+        <div id="referral-code-list" style="margin-top:12px"></div>
+      </div>
       <div class="card" style="border:2px solid #4caf50">
         <div class="card-title">🐑 Pengaturan Paket Tabungan</div>
         <p style="font-size:12px;color:#666;margin-bottom:12px">Atur nama dan harga paket yang tampil di form pendaftaran.</p>
@@ -2035,7 +2233,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
         <div class="form-group"><label class="form-label">Role</label><select class="form-input" id="sec-admin-role"><option value="admin">Admin</option><option value="superadmin">Super Admin</option></select></div>
         <button class="btn btn-primary" onclick="buatAdminBaru()">🔐 Buat Akun Admin</button></div>
       <div class="card"><div class="card-title">🛡️ Daftar Admin</div><div id="security-admin-list"></div></div>
-      <div class="card"><div class="card-title">🔄 Sinkronisasi Data Publik</div><p style="font-size:12px;color:#666;margin-bottom:10px">Memperbarui statistik dan leaderboard publik tanpa membuka data pribadi peserta.</p><button class="btn btn-gold" onclick="syncPublicDashboard()">Sinkronkan Dashboard Publik</button></div>
+      <div class="card"><div class="card-title">🔄 Dashboard Real-Time</div><p style="font-size:12px;color:#666">Statistik publik sekarang diperbarui otomatis ketika peserta mendaftar atau admin mengonfirmasi perubahan data. Tombol sinkronisasi manual tidak lagi diperlukan.</p></div>
     </div>
     <div id="adm-tab-audit" class="superadmin-only" style="display:none">
       <div class="card"><div class="card-title">🧾 100 Aktivitas Terakhir</div><button class="btn btn-outline btn-sm" onclick="refreshAudit()" style="margin-bottom:10px">Muat Ulang</button><div id="audit-list"></div></div>
@@ -2044,7 +2242,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
   </div>
 </div>
 
-<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert · Security v7</span></div>
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert</span></div>
 
 <!-- MODAL SYARAT & KETENTUAN -->
 <div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
