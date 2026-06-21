@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
-<meta name="taqur-build" content="scale-ready-v8-referral-va-realtime">
+<meta name="taqur-build" content="v8-monthly-reminder-report">
 <meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
 <meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
 <meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
@@ -219,6 +219,7 @@ function fallbackCopy(text, cb) {
   try { document.execCommand('copy'); cb(); } catch(e) {}
   document.body.removeChild(el);
 }
+window.copyText=copyText;
 
 // ============================================================
 // SETTINGS (tersimpan di Firestore collection "settings")
@@ -1431,7 +1432,7 @@ window.showAdmTab=function(tab,btn){
   if(tab==='peserta')renderPesertaList();
   if(tab==='va-activation')renderVAActivationList();
   if(tab==='setting'){loadSKEditor();loadPaketSetting();loadKontakEditor();loadReferralCodes();}
-  if(tab==='rekap')renderRekap();
+  if(tab==='rekap'){renderRekap();initMonthlyReminderReport();}
   if(tab==='security')renderAdminUsers();
   if(tab==='audit')renderAuditLog();
 };
@@ -1459,6 +1460,115 @@ async function renderAuditLog(){
   el.innerHTML=rows.length?rows.map(x=>`<div class="history-item" style="align-items:flex-start"><div><div style="font-weight:700;font-size:12px;color:var(--hijau)">${esc(x.action)}</div><div class="h-tgl">${tglFull(x.timestamp)} · ${esc(x.actorName||'-')} (${esc(x.actorRole||'-')})</div><div class="h-tgl">${esc(x.targetType||'')} ${esc(x.targetId||'')}</div><div class="h-tgl" style="word-break:break-word">${esc(JSON.stringify(x.details||{}))}</div></div></div>`).join(''):'<div class="empty-state"><p>Belum ada audit log.</p></div>';
 }
 window.refreshAudit=renderAuditLog;
+
+
+// ============================================================
+// REKAP SETORAN BULANAN & TEKS REMINDER WHATSAPP
+// ============================================================
+let monthlyReminderRows=[];
+
+function currentMonthValue(){
+  const d=new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+}
+function monthPeriodInfo(value){
+  if(!/^\d{4}-\d{2}$/.test(value||''))throw new Error('Pilih periode bulan terlebih dahulu.');
+  const [year,month]=value.split('-').map(Number);
+  const start=`${year}-${String(month).padStart(2,'0')}-01`;
+  const nextDate=new Date(year,month,1);
+  const next=`${nextDate.getFullYear()}-${String(nextDate.getMonth()+1).padStart(2,'0')}-01`;
+  const label=new Intl.DateTimeFormat('id-ID',{month:'long',year:'numeric'}).format(new Date(year,month-1,1));
+  return {year,month,start,next,label,endMs:nextDate.getTime()};
+}
+function firestoreDateMs(ts){
+  if(!ts)return 0;
+  if(typeof ts.toMillis==='function')return ts.toMillis();
+  if(typeof ts.toDate==='function')return ts.toDate().getTime();
+  if(ts.seconds)return Number(ts.seconds)*1000;
+  const d=new Date(ts);return Number.isNaN(d.getTime())?0:d.getTime();
+}
+function initMonthlyReminderReport(){
+  const input=document.getElementById('reminder-period');
+  if(!input)return;
+  if(!input.value)input.value=currentMonthValue();
+  if(!input.dataset.loaded){input.dataset.loaded='1';loadMonthlyReminderReport();}
+}
+window.initMonthlyReminderReport=initMonthlyReminderReport;
+
+window.loadMonthlyReminderReport=async function(){
+  const input=document.getElementById('reminder-period');
+  const result=document.getElementById('monthly-reminder-result');
+  const textArea=document.getElementById('monthly-reminder-text');
+  const loadBtn=document.getElementById('btn-load-monthly-reminder');
+  if(!input||!result||!textArea)return;
+  let period;
+  try{period=monthPeriodInfo(input.value);}catch(e){showPopup('error',e.message);return;}
+  setLoading('btn-load-monthly-reminder',true);
+  result.innerHTML='<div class="empty-state" style="padding:18px"><div class="ei">⏳</div><p>Memeriksa setoran periode '+esc(period.label)+'...</p></div>';
+  textArea.value='';
+  try{
+    const snap=await getDocs(query(collection(db,'setoran'),where('tgl','>=',period.start),where('tgl','<',period.next)));
+    const tx=snap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted');
+    const eligible=allPeserta.filter(p=>{
+      const registered=firestoreDateMs(p.tglDaftar);
+      return !registered||registered<period.endMs;
+    });
+    const statusByParticipant=new Map();
+    eligible.forEach(p=>statusByParticipant.set(p.id,{confirmed:[],pending:[]}));
+    tx.forEach(s=>{
+      const row=statusByParticipant.get(s.pesertaId);
+      if(!row)return;
+      if(s.status==='confirmed')row.confirmed.push(s);
+      else if(s.status==='pending')row.pending.push(s);
+    });
+    const sudah=[],pending=[],belum=[];
+    eligible.forEach(p=>{
+      const rows=statusByParticipant.get(p.id)||{confirmed:[],pending:[]};
+      if(rows.confirmed.length)sudah.push({...p,monthlyRows:rows.confirmed});
+      else if(rows.pending.length)pending.push({...p,monthlyRows:rows.pending});
+      else belum.push(p);
+    });
+    const sortName=(a,b)=>String(a.nama||'').localeCompare(String(b.nama||''),'id');
+    sudah.sort(sortName);pending.sort(sortName);belum.sort(sortName);
+    monthlyReminderRows=belum;
+
+    const listHtml=belum.length?belum.map((p,i)=>`<div class="monthly-reminder-person"><div class="monthly-reminder-number">${i+1}</div><div style="flex:1;min-width:0"><div style="font-weight:700;color:var(--hijau)">${esc(p.nama)}</div><div style="font-size:11px;color:#777">📱 ${esc(p.hp||'-')} · 🏦 ${esc(p.nomorVA||'-')}</div></div><a class="participant-wa-link" href="${participantWaUrl(p)}" target="_blank" rel="noopener">Chat WA</a></div>`).join(''):'<div class="empty-state" style="padding:18px"><div class="ei">✅</div><p>Alhamdulillah, tidak ada peserta yang belum setor pada periode ini.</p></div>';
+
+    result.innerHTML=`<div class="monthly-summary-grid"><div class="monthly-summary-box"><strong>${eligible.length}</strong><span>Peserta periode</span></div><div class="monthly-summary-box success"><strong>${sudah.length}</strong><span>Sudah setor</span></div><div class="monthly-summary-box pending"><strong>${pending.length}</strong><span>Menunggu verifikasi</span></div><div class="monthly-summary-box danger"><strong>${belum.length}</strong><span>Belum setor</span></div></div><div style="font-size:12px;color:#666;margin:12px 0 8px"><strong>Daftar belum setor — ${esc(period.label)}</strong><br><span>Peserta dengan setoran pending tidak dimasukkan ke daftar reminder sampai proses verifikasi selesai.</span></div><div class="monthly-reminder-list">${listHtml}</div>`;
+
+    const names=belum.map((p,i)=>`${i+1}. ${p.nama}`).join('\n');
+    const message=belum.length
+      ? `*REMINDER SETORAN TAQUR — ${period.label.toUpperCase()}*\n\nAssalamu’alaikum warahmatullahi wabarakatuh, Bapak/Ibu peserta TaQur.\n\nBerikut peserta yang *belum tercatat melakukan setoran* untuk periode ${period.label}:\n\n${names}\n\nMohon setoran dilakukan melalui Virtual Account BSI masing-masing. Transfer dari bank selain BSI gunakan *Transfer Online*, bukan BI-FAST.\n\nBagi yang sudah transfer tetapi belum tercatat, mohon konfirmasi kepada admin agar dapat diperiksa. Pesan ini dapat diabaikan apabila setoran baru dilakukan setelah laporan dibuat.\n\nJazakumullahu khairan.\n*Tim TaQur Ar-Ra’i Farm*`
+      : `*REKAP SETORAN TAQUR — ${period.label.toUpperCase()}*\n\nAssalamu’alaikum warahmatullahi wabarakatuh.\n\nAlhamdulillah, seluruh peserta yang terdaftar pada periode ${period.label} sudah memiliki setoran terkonfirmasi atau sedang menunggu verifikasi admin.\n\nJazakumullahu khairan atas komitmen dan amanahnya.\n*Tim TaQur Ar-Ra’i Farm*`;
+    textArea.value=message;
+    document.getElementById('monthly-reminder-actions').style.display='grid';
+  }catch(e){
+    console.error(e);
+    result.innerHTML='<div class="empty-state"><div class="ei">⚠️</div><p>Gagal memuat rekap bulanan.</p></div>';
+    showAlert('alert-monthly-reminder','error','Gagal memuat rekap bulanan: '+authMessage(e));
+  }
+  setLoading('btn-load-monthly-reminder',false);
+};
+
+window.copyMonthlyReminder=function(){
+  const text=document.getElementById('monthly-reminder-text')?.value||'';
+  if(!text)return showPopup('warning','Tampilkan rekap bulanan terlebih dahulu.');
+  copyText(text,'btn-copy-monthly-reminder');
+  showPopup('success','Teks reminder sudah disalin dan siap ditempel ke grup WhatsApp.');
+};
+window.downloadMonthlyReminder=function(){
+  const text=document.getElementById('monthly-reminder-text')?.value||'';
+  const period=document.getElementById('reminder-period')?.value||currentMonthValue();
+  if(!text)return showPopup('warning','Tampilkan rekap bulanan terlebih dahulu.');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));
+  a.download=`reminder-taqur-${period}.txt`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
+window.shareMonthlyReminderWA=function(){
+  const text=document.getElementById('monthly-reminder-text')?.value||'';
+  if(!text)return showPopup('warning','Tampilkan rekap bulanan terlebih dahulu.');
+  window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`,'_blank','noopener');
+};
 
 function renderRekap() {
   const container = document.getElementById('rekap-content');
@@ -1892,6 +2002,22 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
+
+.monthly-reminder-controls{display:grid;grid-template-columns:minmax(180px,1fr) auto;gap:10px;align-items:end}
+.monthly-summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.monthly-summary-box{background:#eef3ef;border:1px solid #d9e7dd;border-radius:11px;padding:10px;text-align:center;color:var(--hijau)}
+.monthly-summary-box strong{display:block;font-family:'Amiri',serif;font-size:23px;line-height:1.1}
+.monthly-summary-box span{font-size:10px;color:#657067}
+.monthly-summary-box.success{background:#e8f5e9;border-color:#c8e6c9}.monthly-summary-box.success strong{color:#2e7d32}
+.monthly-summary-box.pending{background:#fff8e1;border-color:#ffe0b2}.monthly-summary-box.pending strong{color:#ef6c00}
+.monthly-summary-box.danger{background:#ffebee;border-color:#ffcdd2}.monthly-summary-box.danger strong{color:#c62828}
+.monthly-reminder-list{max-height:360px;overflow-y:auto;border:1px solid var(--krem-dark);border-radius:11px;background:#fff}
+.monthly-reminder-person{display:flex;align-items:center;gap:9px;padding:9px 10px;border-bottom:1px dashed var(--krem-dark)}
+.monthly-reminder-person:last-child{border-bottom:none}
+.monthly-reminder-number{width:25px;height:25px;border-radius:50%;background:var(--hijau);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+.monthly-reminder-text{font-family:'Tajawal',sans-serif;font-size:13px;background:#fffdf8}
+.monthly-reminder-actions{grid-template-columns:repeat(3,1fr);gap:8px;margin-top:9px}
+@media(max-width:620px){.monthly-reminder-controls{grid-template-columns:1fr}.monthly-summary-grid{grid-template-columns:repeat(2,1fr)}.monthly-reminder-actions{grid-template-columns:1fr}.monthly-reminder-person{align-items:flex-start}.monthly-reminder-person .participant-wa-link{font-size:10px}}
 </style>
 </head>
 <body>
@@ -2170,6 +2296,22 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
       <div class="card"><div class="card-title">🏦 Aktivasi Virtual Account BSI</div><p style="font-size:12px;color:#666;margin-bottom:10px">Nomor dibuat otomatis dari pola 834576 + 10 digit nomor HP setelah 62. Cocokkan dengan data BSI, edit jika diperlukan, lalu aktifkan.</p><div id="adm-va-activation-list"></div></div>
     </div>
     <div id="adm-tab-rekap" style="display:none">
+      <div class="card monthly-reminder-card" style="border:2px solid var(--hijau)">
+        <div class="card-title">📅 Reminder Setoran Bulanan</div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">Pilih periode untuk melihat peserta yang belum memiliki setoran terkonfirmasi. Setoran yang masih pending ditampilkan terpisah agar tidak salah mengingatkan.</p>
+        <div class="alert" id="alert-monthly-reminder"></div>
+        <div class="monthly-reminder-controls">
+          <div><label class="form-label">Periode Bulan</label><input type="month" class="form-input" id="reminder-period"></div>
+          <button class="btn btn-primary" id="btn-load-monthly-reminder" onclick="loadMonthlyReminderReport()">🔍 Tampilkan Ringkasan</button>
+        </div>
+        <div id="monthly-reminder-result" style="margin-top:12px"><div class="empty-state" style="padding:14px"><p>Pilih periode untuk membuat ringkasan.</p></div></div>
+        <div style="margin-top:14px"><label class="form-label">Teks reminder siap dibagikan ke grup WhatsApp</label><textarea class="form-input monthly-reminder-text" id="monthly-reminder-text" rows="14" placeholder="Teks reminder akan dibuat otomatis..." style="resize:vertical;line-height:1.55"></textarea></div>
+        <div id="monthly-reminder-actions" class="monthly-reminder-actions" style="display:none">
+          <button class="btn btn-primary" id="btn-copy-monthly-reminder" onclick="copyMonthlyReminder()">📋 Salin Teks WA</button>
+          <button class="btn btn-gold" onclick="shareMonthlyReminderWA()">💬 Buka WhatsApp</button>
+          <button class="btn btn-outline" onclick="downloadMonthlyReminder()">⬇️ Download TXT</button>
+        </div>
+      </div>
       <div id="rekap-content">
         <div class="empty-state"><div class="ei">⏳</div><p>Memuat rekap...</p></div>
       </div>
