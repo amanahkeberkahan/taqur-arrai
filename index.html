@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
-<meta name="taqur-build" content="v8-monthly-reminder-report">
+<meta name="taqur-build" content="v8-admin-setoran-transfer-guide">
 <meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
 <meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
 <meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
@@ -28,7 +28,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/fireba
 import {
   getFirestore, collection, addDoc, getDocs, getDoc, setDoc, doc,
   updateDoc, query, where, orderBy, serverTimestamp, writeBatch, limit,
-  onSnapshot, increment
+  onSnapshot, increment, deleteDoc
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import {
   getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
@@ -388,6 +388,11 @@ window.formatNominalSetor = function(el) {
   } else {
     hint.style.display = 'none';
   }
+};
+window.formatRupiahAdmin = function(el) {
+  const raw = String(el.value||'').replace(/\D/g,'');
+  const num = parseInt(raw) || 0;
+  el.value = num ? num.toLocaleString('id-ID') : '';
 };
 // ============================================================
 window.bukaModalSK = function() {
@@ -750,6 +755,18 @@ window.cekKodeReferral=async function(){
     status.textContent='✅ Kode valid: '+(snap.data().label||code);status.className='referral-status valid';
   }catch(e){status.textContent='⚠️ '+e.message+' Perbaiki atau kosongkan kolom.';status.className='referral-status invalid';}
 };
+let editingReferralCode='';
+function resetReferralForm(){
+  editingReferralCode='';
+  const codeEl=document.getElementById('referral-admin-code');
+  const labelEl=document.getElementById('referral-admin-label');
+  const saveBtn=document.getElementById('btn-save-referral');
+  const cancelBtn=document.getElementById('btn-cancel-referral');
+  if(codeEl)codeEl.value='';
+  if(labelEl)labelEl.value='';
+  if(saveBtn)saveBtn.textContent='➕ Buat Kode Referral';
+  if(cancelBtn)cancelBtn.style.display='none';
+}
 async function loadReferralCodes(){
   if(currentAdmin?.role!=='superadmin')return;
   const el=document.getElementById('referral-code-list');if(!el)return;
@@ -757,26 +774,110 @@ async function loadReferralCodes(){
   const rows=snap.docs.map(d=>({code:d.id,...d.data()})).sort((a,b)=>a.code.localeCompare(b.code));
   el.innerHTML=rows.length?rows.map(r=>{
     const count=allPeserta.filter(p=>p.referralCode===r.code).length;
-    return `<div class="referral-admin-row"><div><strong>${esc(r.code)}</strong><div>${esc(r.label||'-')} · ${count} peserta</div></div><button class="btn btn-outline btn-sm" onclick="toggleReferralCode('${esc(r.code)}',${r.active!==true})">${r.active===true?'Nonaktifkan':'Aktifkan'}</button></div>`;
+    return `<div class="referral-admin-row"><div class="referral-admin-info"><strong>${esc(r.code)}</strong><div>${esc(r.label||'-')} · ${count} peserta · ${r.active===true?'Aktif':'Nonaktif'}</div></div><div class="referral-admin-actions"><button class="btn btn-outline btn-sm" onclick="editReferralCode('${esc(r.code)}')">✏️ Edit</button><button class="btn btn-outline btn-sm" onclick="toggleReferralCode('${esc(r.code)}',${r.active!==true})">${r.active===true?'Nonaktifkan':'Aktifkan'}</button><button class="btn btn-sm referral-delete-btn" onclick="hapusReferralCode('${esc(r.code)}')">🗑️ Hapus</button></div></div>`;
   }).join(''):'<div class="empty-state"><p>Belum ada kode referral.</p></div>';
 }
-window.buatKodeReferral=async function(){
+window.simpanKodeReferral=async function(){
   const code=normalizeReferralCode(document.getElementById('referral-admin-code')?.value||'');
   const label=document.getElementById('referral-admin-label')?.value.trim()||'';
   if(!code||code.length<3)return showAlert('alert-referral-admin','error','Kode referral minimal 3 karakter.');
   if(!label)return showAlert('alert-referral-admin','error','Nama sumber/referral wajib diisi.');
   try{
-    const ref=doc(db,'referral_codes',code);
-    if((await getDoc(ref)).exists())throw new Error('Kode referral sudah digunakan.');
-    await setDoc(ref,{code,label,active:true,createdAt:serverTimestamp(),createdBy:currentAdmin.uid});
-    await writeAudit('CREATE_REFERRAL_CODE','referral_codes',code,{label});
-    document.getElementById('referral-admin-code').value='';document.getElementById('referral-admin-label').value='';
-    showAlert('alert-referral-admin','success','Kode referral berhasil dibuat.');await loadReferralCodes();
+    if(!editingReferralCode){
+      const ref=doc(db,'referral_codes',code);
+      if((await getDoc(ref)).exists())throw new Error('Kode referral sudah digunakan.');
+      await setDoc(ref,{code,label,active:true,createdAt:serverTimestamp(),createdBy:currentAdmin.uid});
+      await writeAudit('CREATE_REFERRAL_CODE','referral_codes',code,{label});
+      resetReferralForm();
+      showAlert('alert-referral-admin','success','Kode referral berhasil dibuat.');
+      await loadReferralCodes();
+      return;
+    }
+
+    const oldCode=editingReferralCode;
+    const oldRef=doc(db,'referral_codes',oldCode);
+    const oldSnap=await getDoc(oldRef);
+    if(!oldSnap.exists())throw new Error('Kode referral lama tidak ditemukan. Muat ulang halaman.');
+    if(code!==oldCode && (await getDoc(doc(db,'referral_codes',code))).exists())throw new Error('Kode baru sudah digunakan. Pilih kode lain.');
+
+    const participantSnap=await getDocs(query(collection(db,'peserta'),where('referralCode','==',oldCode)));
+    const participants=participantSnap.docs;
+    const oldData=oldSnap.data();
+
+    if(code===oldCode){
+      await updateDoc(oldRef,{label,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid});
+    }else{
+      await setDoc(doc(db,'referral_codes',code),{
+        ...oldData,code,label,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid,
+        renamedFrom:oldCode,renamedAt:serverTimestamp()
+      });
+    }
+
+    for(let i=0;i<participants.length;i+=400){
+      const batch=writeBatch(db);
+      participants.slice(i,i+400).forEach(p=>batch.update(p.ref,{referralCode:code,referralLabel:label,referralUpdatedAt:serverTimestamp()}));
+      await batch.commit();
+    }
+    if(code!==oldCode)await deleteDoc(oldRef);
+
+    allPeserta.forEach(p=>{if(p.referralCode===oldCode){p.referralCode=code;p.referralLabel=label;}});
+    await writeAudit('UPDATE_REFERRAL_CODE','referral_codes',code,{oldCode,newCode:code,label,migratedParticipants:participants.length});
+    resetReferralForm();
+    showAlert('alert-referral-admin','success',`Kode referral berhasil diperbarui${participants.length?` dan ${participants.length} peserta ikut disesuaikan`:''}.`);
+    await loadReferralCodes();
+  }catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
+};
+window.buatKodeReferral=window.simpanKodeReferral;
+window.editReferralCode=async function(code){
+  try{
+    const snap=await getDoc(doc(db,'referral_codes',code));
+    if(!snap.exists())throw new Error('Kode referral tidak ditemukan.');
+    editingReferralCode=code;
+    document.getElementById('referral-admin-code').value=code;
+    document.getElementById('referral-admin-label').value=snap.data().label||'';
+    document.getElementById('btn-save-referral').textContent='💾 Simpan Perubahan';
+    document.getElementById('btn-cancel-referral').style.display='inline-flex';
+    document.getElementById('referral-admin-code').focus();
+    showAlert('alert-referral-admin','info','Mode edit aktif. Ubah kode atau nama sumber, lalu simpan.');
+  }catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
+};
+window.batalEditReferral=function(){resetReferralForm();showAlert('alert-referral-admin','info','Edit kode referral dibatalkan.');};
+window.hapusReferralCode=async function(code){
+  if(currentAdmin?.role!=='superadmin')return;
+  const count=allPeserta.filter(p=>p.referralCode===code).length;
+  const message=count
+    ? `Kode ${code} sudah digunakan oleh ${count} peserta. Kode akan dihapus dari daftar aktif sehingga tidak dapat dipakai pendaftaran baru, tetapi riwayat referral peserta lama tetap tersimpan. Lanjutkan?`
+    : `Hapus kode referral ${code}? Tindakan ini tidak dapat dibatalkan.`;
+  if(!confirm(message))return;
+  try{
+    const snap=await getDoc(doc(db,'referral_codes',code));
+    if(!snap.exists())throw new Error('Kode referral tidak ditemukan.');
+    await deleteDoc(doc(db,'referral_codes',code));
+    await writeAudit('DELETE_REFERRAL_CODE','referral_codes',code,{label:snap.data().label||'',historicalParticipants:count});
+    if(editingReferralCode===code)resetReferralForm();
+    showAlert('alert-referral-admin','success',count?'Kode dihapus dari daftar aktif. Riwayat peserta lama tetap tersimpan.':'Kode referral berhasil dihapus.');
+    await loadReferralCodes();
   }catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
 };
 window.toggleReferralCode=async function(code,active){
   try{await updateDoc(doc(db,'referral_codes',code),{active,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid});await writeAudit(active?'ENABLE_REFERRAL_CODE':'DISABLE_REFERRAL_CODE','referral_codes',code,{});await loadReferralCodes();}
   catch(e){showAlert('alert-referral-admin','error',authMessage(e));}
+};
+
+// ============================================================
+// PUSAT PANDUAN - PDF dimuat hanya saat dibuka
+// ============================================================
+window.bukaPanduan=function(){
+  const modal=document.getElementById('modal-panduan');
+  const adminCard=document.getElementById('panduan-admin-card');
+  if(adminCard)adminCard.style.display=currentAdmin?'block':'none';
+  if(modal){modal.classList.add('open');document.body.style.overflow='hidden';}
+};
+window.tutupPanduan=function(e){
+  const modal=document.getElementById('modal-panduan');
+  if(e&&e.target!==modal)return;
+  modal?.classList.remove('open');
+  document.body.style.overflow='';
 };
 
 // ============================================================
@@ -786,13 +887,15 @@ function renderVAResult(p){
   const resEl=document.getElementById('va-result');
   const status=p.statusVA||(p.nomorVA?'active':'review');
   if(!p.nomorVA){
-    resEl.innerHTML=`<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center"><div style="font-size:36px;margin-bottom:8px">⏳</div><div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Dalam Pemeriksaan</div><div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6">Halo <strong>${esc(p.nama)}</strong>, pola nomor VA Anda memerlukan pemeriksaan admin. Mohon tunggu maksimal 1×24 jam atau hubungi admin.</div></div>`;
+    resEl.innerHTML=`<div style="background:linear-gradient(135deg,var(--hijau),#0f2d1a);border-radius:16px;padding:22px 18px;text-align:center"><div style="font-size:36px;margin-bottom:8px">⏳</div><div style="font-family:'Amiri',serif;font-size:20px;color:var(--emas);margin-bottom:8px">No. VA Dalam Pemeriksaan</div><div style="font-size:13px;color:rgba(255,255,255,.8);line-height:1.6">Halo <strong>${esc(p.nama)}</strong>, pola nomor VA Anda memerlukan pemeriksaan admin. Mohon tunggu maksimal 1×24 jam atau hubungi admin.</div></div><div class="va-alert-critical">⚠️ Jangan transfer sebelum nomor VA tampil dan statusnya <strong>Aktif</strong>.</div>`;
   }else if(status!=='active'){
-    resEl.innerHTML=`<div class="va-card va-pending-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Calon Virtual Account BSI</div><div class="va-number">${esc(p.nomorVA)}</div><div class="va-status pending">⏳ Menunggu Aktivasi Admin / BSI</div><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div></div></div><div class="va-alert-critical">⚠️ Nomor VA belum aktif. Jangan melakukan transfer. Hubungi admin untuk aktivasi atau tunggu maksimal 1×24 jam.</div>`;
+    resEl.innerHTML=`<div class="va-card va-pending-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Calon Virtual Account BSI</div><div class="va-number">${esc(p.nomorVA)}</div><div class="va-status pending">⏳ Menunggu Aktivasi Admin / BSI</div><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div></div></div><div class="va-alert-critical">⚠️ Nomor VA belum aktif. Jangan melakukan transfer. Hubungi admin untuk aktivasi atau tunggu maksimal 1×24 jam.</div><div class="va-transfer-guide"><div class="guide-title">Panduan transfer setelah VA aktif</div><ol><li>Pastikan status nomor VA sudah <strong>Aktif</strong>.</li><li>Transfer dari bank selain BSI wajib memilih metode <strong>Transfer Online</strong>, bukan BI-FAST.</li><li>Sebelum transfer, pastikan nama penerima sesuai dengan nama peserta.</li></ol></div>`;
     const key='taqur-va-pending-'+p.id;
     if(!sessionStorage.getItem(key)){sessionStorage.setItem(key,'1');setTimeout(()=>showPopup('warning','Nomor VA Anda sudah dibuat, tetapi belum aktif. Jangan transfer sebelum status berubah menjadi Aktif. Hubungi admin atau tunggu maksimal 1×24 jam.'),100);}
   }else{
-    resEl.innerHTML=`<div class="va-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Virtual Account BSI</div><div class="va-status active">✅ Aktif</div><div class="va-number">${esc(p.nomorVA)}</div><button class="btn-copy" id="btn-copy-va" onclick="copyText('${esc(p.nomorVA)}','btn-copy-va')">📋 Salin No. VA</button><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div><div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div></div></div><div class="va-warn-box">⚠️ Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan bagikan ke orang lain.</div><div class="va-transfer-note"><strong>Transfer dari bank selain BSI:</strong> jangan menggunakan BI-FAST. Pilih metode <strong>Transfer Online</strong> agar transaksi Virtual Account dapat diproses.</div>`;
+    resEl.innerHTML=`<div class="va-card"><div class="va-bank">🏦 Bank Syariah Indonesia</div><div class="va-label">Virtual Account BSI</div><div class="va-status active">✅ Aktif</div><div class="va-number">${esc(p.nomorVA)}</div><button class="btn-copy" id="btn-copy-va" onclick="copyText('${esc(p.nomorVA)}','btn-copy-va')">📋 Salin No. VA</button><div class="va-owner"><div style="font-size:12px;color:rgba(255,255,255,.6)">Atas nama penabung</div><div style="font-size:15px;font-weight:700;color:var(--emas-light)">${esc(p.nama)}</div><div style="font-size:11px;color:rgba(255,255,255,.5)">${esc(p.jenis)}</div><div style="font-size:11px;color:var(--emas-light);margin-top:4px">🎯 Target: ${rp(p.targetNominal||0)}</div></div></div><div class="va-alert-critical">⚠️ Jika transfer dari bank selain BSI, <strong>jangan menggunakan BI-FAST</strong>. Pilih metode <strong>Transfer Online</strong> agar transaksi Virtual Account BSI dapat diproses.</div><div class="va-transfer-guide"><div class="guide-title">Cara transfer dari rekening BSI</div><ol><li>Buka BSI Mobile/BSI Net/ATM BSI.</li><li>Pilih menu <strong>Pembayaran</strong>, <strong>Transfer Virtual Account</strong>, atau menu sejenis yang menampilkan Virtual Account BSI.</li><li>Masukkan nomor VA: <strong>${esc(p.nomorVA)}</strong>.</li><li>Periksa nama penerima: <strong>${esc(p.nama)}</strong>.</li><li>Masukkan nominal setoran, lalu selesaikan transaksi.</li><li>Simpan bukti transfer sampai saldo terkonfirmasi.</li></ol><div class="guide-title" style="margin-top:10px">Cara transfer dari bank lain</div><ol><li>Pilih menu <strong>Transfer</strong> ke bank lain atau <strong>Virtual Account</strong>.</li><li>Pilih bank tujuan <strong>Bank Syariah Indonesia (BSI)</strong>.</li><li>Masukkan nomor VA: <strong>${esc(p.nomorVA)}</strong>.</li><li>Pilih metode <strong>Transfer Online</strong>. Jangan pilih BI-FAST.</li><li>Periksa nama penerima dan nominal, lalu lanjutkan transfer.</li><li>Simpan bukti transfer sampai saldo terkonfirmasi.</li></ol></div><div class="va-warn-box">Nomor VA ini <strong>khusus untuk Anda</strong>. Jangan digunakan oleh peserta lain.</div>`;
+    const key='taqur-va-online-note-'+p.id;
+    if(!sessionStorage.getItem(key)){sessionStorage.setItem(key,'1');setTimeout(()=>showPopup('warning','Catatan transfer VA BSI: dari bank selain BSI jangan gunakan BI-FAST. Pilih Transfer Online agar pembayaran dapat diproses.'),100);}
   }
   resEl.style.display='block';
 }
@@ -1142,8 +1245,9 @@ async function renderDetail() {
     <div class="card" style="border:${p.nomorVA?'1px solid rgba(201,168,76,.2)':'2px solid #e53935'}"><div class="card-title">🏦 Virtual Account BSI</div>
       <div class="va-assigned" style="border-color:${effectiveVAStatus(p)==='active'?'#4caf50':'#ff9800'}"><div style="font-size:11px;color:#888;margin-bottom:4px">No. VA BSI · ${vaStatusLabel(effectiveVAStatus(p))}</div><div class="va-assigned-num">${esc(p.nomorVA||generateVA(p.hp)||'-')}</div></div><div style="display:flex;gap:8px;margin-top:8px"><input type="text" class="form-input" id="va-inp-${p.id}" value="${esc(p.nomorVA||generateVA(p.hp))}" style="font-size:13px"><button class="btn btn-primary btn-sm" onclick="approveVA('${p.id}')">Approve & Aktifkan</button></div></div>
     <div class="card"><div class="card-title">🎯 Ubah Target Nominal</div><div style="display:flex;gap:8px"><div style="flex:1;position:relative"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;color:var(--hijau);font-weight:700">Rp</span><input type="number" class="form-input" id="target-inp-${p.id}" value="${targetP}" style="padding-left:36px;font-size:13px"></div><button class="btn btn-outline btn-sm" onclick="simpanTargetPeserta('${p.id}')">Simpan</button></div></div>
+    <div class="card admin-manual-setor-card"><div class="card-title">➕ Input Setoran dari Mutasi Bank</div><div class="admin-manual-note">Gunakan fitur ini jika peserta sudah transfer dan dana terlihat di rekening/VA BSI, tetapi peserta belum melaporkan setoran di aplikasi. Setoran akan langsung masuk sebagai <strong>Dikonfirmasi</strong>.</div><div class="admin-manual-setor-grid"><div><label class="form-label">Nominal Masuk</label><input type="text" inputmode="numeric" class="form-input" id="admin-setor-nom-${p.id}" placeholder="Contoh: 250.000" oninput="formatRupiahAdmin(this)"></div><div><label class="form-label">Tanggal Masuk</label><input type="date" class="form-input" id="admin-setor-tgl-${p.id}" value="${new Date().toISOString().split('T')[0]}"></div><div><label class="form-label">Nama Pengirim di Mutasi</label><input type="text" class="form-input" id="admin-setor-rekon-${p.id}" placeholder="Nama di mutasi bank"></div><div><label class="form-label">Waktu/Jam Mutasi</label><input type="text" class="form-input" id="admin-setor-waktu-${p.id}" placeholder="Contoh: 15/07 09:35"></div></div><label class="form-label" style="margin-top:8px">Catatan Admin</label><input type="text" class="form-input" id="admin-setor-catatan-${p.id}" placeholder="Contoh: Input admin karena peserta belum konfirmasi"><button class="btn btn-primary" onclick="adminTambahSetoran('${p.id}')" style="margin-top:10px">✅ Simpan sebagai Dana Masuk</button></div>
     ${pending.length?`<div class="pending-notice" style="display:block;margin-bottom:12px">⏳ ${pending.length} setoran pending (${rp(pending.reduce((a,x)=>a+x.nominal,0))})</div>`:''}
-    <div class="card"><div class="card-title">📋 Riwayat Setoran</div>${setoranP.length?setoranP.map(x=>{const badge=x.status==='confirmed'?'<span class="badge badge-green">✅</span>':x.status==='rejected'?'<span class="badge badge-red">❌</span>':'<span class="badge badge-yellow">⏳</span>';return `<div class="s-detail-item"><div><div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(x.nominal)} ${badge}</div><div style="font-size:11px;color:#888">${tglFull(x.tglInput)} · Transfer VA BSI</div>${x.catatan?`<div style="font-size:11px;color:#888">📝 ${esc(x.catatan)}</div>`:''}${x.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${esc(x.rekonNama)} · ${esc(x.rekonWaktu||'')}</div>`:''}${x.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>${x.status==='pending'?`<div class="rekon-box" style="margin-top:8px"><input type="text" class="form-input" id="rn-${x.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rw-${x.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rt-${x.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px"><div style="display:flex;gap:8px"><button class="btn-confirm" onclick="konfirmasi('${x.id}',true)">✅ Dana Masuk</button><button class="btn-reject" onclick="konfirmasi('${x.id}',false)">❌ Tolak</button></div></div>`:''}</div>`}).join(''):'<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}</div>
+    <div class="card"><div class="card-title">📋 Riwayat Setoran</div>${setoranP.length?setoranP.map(x=>{const badge=x.status==='confirmed'?'<span class="badge badge-green">✅</span>':x.status==='rejected'?'<span class="badge badge-red">❌</span>':'<span class="badge badge-yellow">⏳</span>';return `<div class="s-detail-item"><div><div style="font-weight:700;font-size:13px;color:var(--hijau)">${rp(x.nominal)} ${badge}</div><div style="font-size:11px;color:#888">${tglFull(x.tglInput)} · Transfer VA BSI${x.inputOlehAdmin?' · Input Admin':''}</div>${x.catatan?`<div style="font-size:11px;color:#888">📝 ${esc(x.catatan)}</div>`:''}${x.rekonNama?`<div style="font-size:11px;color:var(--hijau-mid)">🏦 ${esc(x.rekonNama)} · ${esc(x.rekonWaktu||'')}</div>`:''}${x.alasanTolak?`<div style="font-size:11px;color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>${x.status==='pending'?`<div class="rekon-box" style="margin-top:8px"><input type="text" class="form-input" id="rn-${x.id}" placeholder="Nama pengirim di mutasi VA" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rw-${x.id}" placeholder="Waktu masuk" style="margin-bottom:6px;font-size:12px"><input type="text" class="form-input" id="rt-${x.id}" placeholder="Alasan tolak (jika ditolak)" style="margin-bottom:8px;font-size:12px"><div style="display:flex;gap:8px"><button class="btn-confirm" onclick="konfirmasi('${x.id}',true)">✅ Dana Masuk</button><button class="btn-reject" onclick="konfirmasi('${x.id}',false)">❌ Tolak</button></div></div>`:''}</div>`}).join(''):'<div class="empty-state"><div class="ei">📭</div><p>Belum ada setoran</p></div>'}</div>
     <button class="btn btn-outline" onclick="exportPesertaCSV('${p.id}')" style="margin-bottom:10px">📤 Export CSV Peserta Ini</button>
     ${currentAdmin?.role==='superadmin'?`<div style="border-top:2px dashed #fde8e8;padding-top:14px;margin-top:4px"><button class="btn" onclick="hapusPeserta('${p.id}')" style="background:#fde8e8;color:#c62828;border:1.5px solid #ef9a9a;width:100%;font-weight:700">🗑️ Hapus Peserta Ini</button><div style="font-size:10px;color:#e57373;margin-top:5px;text-align:center">⚠️ Hanya Super Admin · soft delete dan akses login dinonaktifkan</div></div>`:''}`;
 }
@@ -1173,6 +1277,30 @@ window.simpanTargetPeserta=async function(pid){
   const v=parseInt(document.getElementById('target-inp-'+pid)?.value);if(!v||v<100000)return alert('Target minimal Rp 100.000.');
   try{await updateDoc(doc(db,'peserta',pid),{targetNominal:v});await writeAudit('UPDATE_TARGET','peserta',pid,{targetNominal:v});await renderAdminPanel();if(adminView==='detail')renderDetail();showAlert('alert-adm-panel','success','✅ Target peserta diperbarui: '+rp(v));}
   catch(e){alert('Gagal: '+authMessage(e));}
+};
+
+window.adminTambahSetoran=async function(pid){
+  const p=allPeserta.find(x=>x.id===pid);if(!p)return showAlert('alert-adm-panel','error','Data peserta tidak ditemukan.');
+  const nominal=parseInt((document.getElementById('admin-setor-nom-'+pid)?.value||'').replace(/\D/g,''))||0;
+  const tgl=document.getElementById('admin-setor-tgl-'+pid)?.value||'';
+  const rekonNama=document.getElementById('admin-setor-rekon-'+pid)?.value.trim()||'';
+  const rekonWaktu=document.getElementById('admin-setor-waktu-'+pid)?.value.trim()||'';
+  const catatan=document.getElementById('admin-setor-catatan-'+pid)?.value.trim()||'Input admin berdasarkan mutasi bank/VA BSI.';
+  if(!nominal||nominal<1000)return showAlert('alert-adm-panel','error','Nominal setoran minimal Rp 1.000.');
+  if(!tgl)return showAlert('alert-adm-panel','error','Tanggal masuk wajib diisi.');
+  if(!p.nomorVA&&!confirm('Peserta belum memiliki nomor VA. Tetap input setoran?'))return;
+  if(effectiveVAStatus(p)!=='active'&&!confirm('Status VA peserta belum aktif. Pastikan dana benar-benar sudah masuk sebelum melanjutkan. Tetap simpan?'))return;
+  if(!confirm(`Simpan setoran ${rp(nominal)} untuk ${p.nama} sebagai Dana Masuk?`))return;
+  try{
+    const ref=doc(collection(db,'setoran'));
+    const batch=writeBatch(db);
+    batch.set(ref,{pesertaId:pid,ownerUid:p.authUid||'',nama:p.nama||'',hp:p.hp||'',nomorVA:p.nomorVA||'',nominal,tgl,catatan,cara:'Transfer VA BSI',status:'confirmed',tglInput:serverTimestamp(),tglKonfirmasi:serverTimestamp(),konfirmasiOleh:currentAdmin.nama,rekonNama,rekonWaktu,inputOlehAdmin:true,sumberInput:'admin_mutasi_bank'});
+    batch.update(doc(db,'peserta',pid),{saldoConfirmed:increment(nominal),jumlahSetorConfirmed:increment(1),lastSetorAt:serverTimestamp()});
+    await batch.commit();
+    await writeAudit('ADMIN_ADD_CONFIRMED_SETORAN','setoran',ref.id,{pesertaId:pid,nominal,rekonNama,rekonWaktu});
+    showAlert('alert-adm-panel','success','✅ Setoran berhasil ditambahkan oleh admin dan langsung masuk saldo peserta.');
+    await renderAdminPanel();if(adminView==='detail')renderDetail();
+  }catch(e){showAlert('alert-adm-panel','error','Gagal menambahkan setoran: '+authMessage(e));}
 };
 
 window.konfirmasi=async function(sid,approve){
@@ -1998,7 +2126,8 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .va-alert-critical{background:#ffebee;border-left:4px solid #d32f2f;border-radius:10px;padding:12px;margin-top:10px;color:#b71c1c;font-size:12px;line-height:1.55}
 .va-transfer-note{background:#fff8e1;border:1px solid #f0cf72;border-radius:10px;padding:12px;margin-top:10px;color:#6d5200;font-size:12px;line-height:1.55}
 .va-activation-row{background:#fff;border:1px solid var(--krem-dark);border-radius:12px;padding:12px;margin-bottom:10px}.va-activation-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px;font-size:11px;color:#777}.va-activation-head strong{display:block;color:var(--hijau);font-size:14px;margin-bottom:2px}.va-activation-actions{display:flex;gap:8px;margin-top:8px}.inline-badge{position:static;transform:none;display:none;margin-left:3px;vertical-align:middle}
-.referral-admin-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px dashed var(--krem-dark);font-size:11px;color:#777}.referral-admin-row strong{display:block;color:var(--hijau);font-size:13px}.admin-pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin:12px 0;font-size:11px;color:#666}.admin-pagination button:disabled{opacity:.35;cursor:not-allowed}
+.referral-admin-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px dashed var(--krem-dark);font-size:11px;color:#777}.referral-admin-row strong{display:block;color:var(--hijau);font-size:13px}.referral-admin-info{flex:1;min-width:0}.referral-admin-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.referral-delete-btn{background:#fde8e8;color:#c62828;border:1px solid #ef9a9a;font-weight:700}.referral-form-actions{display:flex;gap:8px;margin-top:8px}.referral-form-actions .btn{flex:1}.admin-pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin:12px 0;font-size:11px;color:#666}.admin-pagination button:disabled{opacity:.35;cursor:not-allowed}
+.footer-guide-btn{margin:5px 0 3px;background:transparent;border:none;color:var(--hijau-mid);font-family:'Tajawal',sans-serif;font-size:10.5px;font-weight:700;text-decoration:underline;text-underline-offset:3px;cursor:pointer}.guide-modal-box{max-width:440px}.guide-download-card{border:1px solid var(--krem-dark);border-radius:14px;padding:15px;margin-bottom:11px;background:#fff;box-shadow:0 2px 10px rgba(26,74,46,.06);text-align:center}.guide-admin-card{border-color:#d8c48b;background:#fffdf8}.guide-download-icon{font-size:28px;margin-bottom:4px}.guide-download-title{font-family:'Amiri',serif;font-size:18px;font-weight:700;color:var(--hijau)}.guide-download-desc{font-size:11.5px;line-height:1.55;color:#666;margin:4px 0 11px}.guide-download-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.guide-download-actions .btn{text-decoration:none;text-align:center}.guide-light-note{font-size:10.5px;line-height:1.55;color:#666;background:#eef5f0;border-left:3px solid var(--hijau-mid);border-radius:8px;padding:10px 11px}@media(max-width:620px){.referral-admin-row{align-items:flex-start;flex-direction:column}.referral-admin-actions{width:100%;justify-content:flex-start}.referral-admin-actions .btn{flex:1}.referral-form-actions{flex-direction:column}.guide-download-actions{grid-template-columns:1fr}}
 
 ::-webkit-scrollbar{width:4px;}
 ::-webkit-scrollbar-thumb{background:var(--emas-light);border-radius:2px;}
@@ -2018,6 +2147,16 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .monthly-reminder-text{font-family:'Tajawal',sans-serif;font-size:13px;background:#fffdf8}
 .monthly-reminder-actions{grid-template-columns:repeat(3,1fr);gap:8px;margin-top:9px}
 @media(max-width:620px){.monthly-reminder-controls{grid-template-columns:1fr}.monthly-summary-grid{grid-template-columns:repeat(2,1fr)}.monthly-reminder-actions{grid-template-columns:1fr}.monthly-reminder-person{align-items:flex-start}.monthly-reminder-person .participant-wa-link{font-size:10px}}
+
+.va-transfer-guide{background:#fffdf7;border:1.5px solid var(--emas-pale);border-radius:14px;padding:13px 14px;margin-top:12px;color:#1a4a2e;font-size:12.5px;line-height:1.55}
+.va-transfer-guide .guide-title{font-weight:800;color:var(--hijau);margin-bottom:6px}
+.va-transfer-guide ol{padding-left:18px;margin:0}
+.va-transfer-guide li{margin-bottom:5px}
+.admin-manual-setor-card{border:2px solid rgba(45,106,68,.25);background:linear-gradient(180deg,#fff,#fffdf7)}
+.admin-manual-setor-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.admin-manual-note{font-size:11px;color:#666;background:#fff8e1;border:1px solid var(--emas-pale);border-radius:10px;padding:9px 10px;line-height:1.45;margin-top:8px}
+@media(max-width:640px){.admin-manual-setor-grid{grid-template-columns:1fr}}
+
 </style>
 </head>
 <body>
@@ -2243,7 +2382,7 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
   <div id="admin-panel" style="display:none">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div id="adm-welcome" style="font-size:12px;font-weight:700;color:var(--hijau)"></div>
-      <button class="btn btn-outline btn-sm" onclick="adminLogout()">Keluar</button>
+      <div style="display:flex;gap:7px;align-items:center"><button class="btn btn-outline btn-sm" onclick="bukaPanduan()">📘 Panduan</button><button class="btn btn-outline btn-sm" onclick="adminLogout()">Keluar</button></div>
     </div>
     <div class="stats-grid">
       <div class="stat-box"><span class="stat-val" id="adm-peserta">—</span><div class="stat-lbl">Peserta</div></div>
@@ -2322,7 +2461,8 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
         <p style="font-size:12px;color:#666;margin-bottom:10px">Buat kode untuk membedakan peserta referral dan peserta organik.</p>
         <div class="alert" id="alert-referral-admin"></div>
         <div style="display:grid;grid-template-columns:1fr 1.5fr;gap:8px"><input class="form-input" id="referral-admin-code" placeholder="Kode: BMK001" oninput="this.value=normalizeReferralCode(this.value)"><input class="form-input" id="referral-admin-label" placeholder="Nama sumber/referral"></div>
-        <button class="btn btn-primary" onclick="buatKodeReferral()" style="margin-top:8px">➕ Buat Kode Referral</button>
+        <div class="referral-form-actions"><button class="btn btn-primary" id="btn-save-referral" onclick="simpanKodeReferral()">➕ Buat Kode Referral</button><button class="btn btn-outline" id="btn-cancel-referral" onclick="batalEditReferral()" style="display:none">Batal Edit</button></div>
+        <div style="font-size:10.5px;color:#777;margin-top:7px;line-height:1.5">Edit kode akan menyesuaikan kode pada peserta yang sudah terdaftar. Hapus kode menghentikan pendaftaran baru, sedangkan riwayat referral peserta lama tetap tersimpan.</div>
         <div id="referral-code-list" style="margin-top:12px"></div>
       </div>
       <div class="card" style="border:2px solid #4caf50">
@@ -2384,7 +2524,33 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
   </div>
 </div>
 
-<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert</span></div>
+<div class="footer-note">🌙 TaQur — Tabung Qurban · Ar-Ra'i Farm<br><button class="footer-guide-btn" onclick="bukaPanduan()">📘 Pusat Panduan</button><br><span style="font-size:10px;color:#bbb;cursor:pointer;user-select:none" onclick="aksesAdmin()" id="footer-axpert">Powered by AccountXpert</span></div>
+
+<!-- MODAL PUSAT PANDUAN -->
+<div id="modal-panduan" class="modal-overlay" onclick="tutupPanduan(event)">
+  <div class="modal-box guide-modal-box">
+    <div class="modal-header">
+      <div class="modal-title">📘 Pusat Panduan TaQur</div>
+      <div class="modal-subtitle">PDF dibuka terpisah agar aplikasi tetap ringan</div>
+      <button class="modal-close" onclick="tutupPanduan()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="guide-download-card">
+        <div class="guide-download-icon">👤</div>
+        <div class="guide-download-title">Panduan Peserta</div>
+        <div class="guide-download-desc">Pendaftaran, aktivasi VA, setoran, cek saldo, PIN, dan bantuan.</div>
+        <div class="guide-download-actions"><a class="btn btn-primary btn-sm" href="panduan-peserta-taqur.pdf" target="_blank" rel="noopener">Preview PDF</a><a class="btn btn-outline btn-sm" href="panduan-peserta-taqur.pdf" download>Download</a></div>
+      </div>
+      <div class="guide-download-card guide-admin-card" id="panduan-admin-card" style="display:none">
+        <div class="guide-download-icon">🔐</div>
+        <div class="guide-download-title">Panduan Admin</div>
+        <div class="guide-download-desc">Operasional peserta, VA, setoran, referral, rekap, keamanan, dan Apps Script.</div>
+        <div class="guide-download-actions"><a class="btn btn-primary btn-sm" href="panduan-admin-taqur.pdf" target="_blank" rel="noopener">Preview PDF</a><a class="btn btn-outline btn-sm" href="panduan-admin-taqur.pdf" download>Download</a></div>
+      </div>
+      <div class="guide-light-note">File PDF tidak dimuat bersama halaman utama. Dokumen baru diunduh oleh browser ketika tombol Preview atau Download ditekan.</div>
+    </div>
+  </div>
+</div>
 
 <!-- MODAL SYARAT & KETENTUAN -->
 <div id="modal-sk" class="modal-overlay" onclick="tutupModalSK(event)">
