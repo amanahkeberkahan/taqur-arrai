@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TaQur — Tabung Qurban Ar-Ra'i Farm</title>
-<meta name="taqur-build" content="v8-admin-setoran-transfer-guide">
+<meta name="taqur-build" content="v8-kwitansi-setoran">
 <meta name="description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H.">
 <meta property="og:title" content="TaQur — Tabung Qurban Ar-Ra'i Farm">
 <meta property="og:description" content="Program Tabung Qurban bersama Ar-Ra'i Farm. Kambing, Domba & Patungan Sapi untuk Idul Adha 1448 H. Amanah, Sehat, Berkualitas.">
@@ -139,6 +139,77 @@ const tglFull = ts => {
   if (!ts) return '-';
   const d = ts.toDate ? ts.toDate() : new Date(ts);
   return d.toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'});
+};
+
+function receiptDate(value){
+  if(!value) return '-';
+  const d=value.toDate ? value.toDate() : new Date(value);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleDateString('id-ID',{day:'2-digit',month:'long',year:'numeric'});
+}
+
+function drawReceiptText(ctx,text,x,y,maxWidth,lineHeight){
+  const words=String(text||'-').split(/\s+/); let line='';
+  words.forEach(word=>{
+    const test=line ? line+' '+word : word;
+    if(ctx.measureText(test).width>maxWidth && line){ctx.fillText(line,x,y);line=word;y+=lineHeight;}
+    else line=test;
+  });
+  ctx.fillText(line,x,y); return y;
+}
+
+function terbilangRupiah(value){
+  const words=['','satu','dua','tiga','empat','lima','enam','tujuh','delapan','sembilan','sepuluh','sebelas'];
+  const spell=n=>{
+    n=Math.floor(Number(n)||0);
+    if(n<12)return words[n];
+    if(n<20)return spell(n-10)+' belas';
+    if(n<100)return spell(Math.floor(n/10))+' puluh'+(n%10?' '+spell(n%10):'');
+    if(n<200)return 'seratus'+(n-100?' '+spell(n-100):'');
+    if(n<1000)return spell(Math.floor(n/100))+' ratus'+(n%100?' '+spell(n%100):'');
+    if(n<2000)return 'seribu'+(n-1000?' '+spell(n-1000):'');
+    if(n<1000000)return spell(Math.floor(n/1000))+' ribu'+(n%1000?' '+spell(n%1000):'');
+    if(n<1000000000)return spell(Math.floor(n/1000000))+' juta'+(n%1000000?' '+spell(n%1000000):'');
+    if(n<1000000000000)return spell(Math.floor(n/1000000000))+' miliar'+(n%1000000000?' '+spell(n%1000000000):'');
+    return String(n);
+  };
+  const result=spell(value).trim();return (result.charAt(0).toUpperCase()+result.slice(1)+' rupiah').trim();
+}
+
+window.downloadKwitansi=function(setoranId){
+  const s=(window.taqurReceiptRows||[]).find(x=>x.id===setoranId);
+  const p=currentParticipant||selPeserta;
+  if(!s||s.status!=='confirmed'||!p) return showPopup('warning','Kwitansi hanya tersedia untuk setoran yang sudah dikonfirmasi.','Kwitansi Belum Tersedia');
+  const canvas=document.createElement('canvas'); canvas.width=1800; canvas.height=1050;
+  const c=canvas.getContext('2d');
+  c.fillStyle='#eaf4ee';c.fillRect(0,0,canvas.width,canvas.height);
+  c.fillStyle='#fffdf8';c.fillRect(42,42,1716,966);
+  c.strokeStyle='#0d472d';c.lineWidth=6;c.strokeRect(58,58,1684,934);
+  c.strokeStyle='#d4b553';c.lineWidth=2;c.strokeRect(72,72,1656,906);
+  c.fillStyle='#0d472d';c.fillRect(73,73,1654,145);
+  c.textAlign='left';c.fillStyle='#e9c867';c.font='bold 66px Georgia';c.fillText('TaQur',115,150);
+  c.fillStyle='#fff';c.font='21px Arial';c.fillText('TABUNG QURBAN - AR-RA\'I FARM',115,186);
+  c.textAlign='center';c.font='bold 38px Arial';c.fillText('KWITANSI ELEKTRONIK',1030,135);
+  c.font='20px Arial';c.fillStyle='#d9ebe0';c.fillText('Bukti penerimaan setoran yang sah dan terverifikasi sistem',1030,174);
+  const no='TQ-'+String(s.id).slice(0,12).toUpperCase();
+  c.textAlign='left';c.fillStyle='#143d2b';c.font='bold 25px Arial';c.fillText('No.',115,286);c.font='25px Arial';c.fillText(no,245,286);
+  c.font='bold 25px Arial';c.fillText('Tanggal',1160,286);c.font='25px Arial';c.fillText(receiptDate(s.tglKonfirmasi||s.tglInput),1310,286);
+  c.strokeStyle='#b9c8bf';c.lineWidth=2;c.beginPath();c.moveTo(245,299);c.lineTo(800,299);c.moveTo(1310,299);c.lineTo(1650,299);c.stroke();
+  const field=(label,value,y)=>{c.fillStyle='#143d2b';c.font='bold 27px Arial';c.fillText(label,115,y);c.font='27px Arial';drawReceiptText(c,value,395,y,1225,34);c.strokeStyle='#c4cec8';c.lineWidth=2;c.beginPath();c.moveTo(395,y+13);c.lineTo(1650,y+13);c.stroke();};
+  field('Terima dari',p.nama||s.nama,380);
+  field('Terbilang',terbilangRupiah(s.nominal),465);
+  field('Untuk pembayaran',`Setoran Tabungan Qurban - ${p.jenis||'Program TaQur'} melalui ${s.cara||'Transfer VA BSI'}`,550);
+  c.fillStyle='#f2ead0';c.strokeStyle='#0d472d';c.lineWidth=4;c.beginPath();c.roundRect(115,635,680,140,18);c.fill();c.stroke();
+  c.fillStyle='#143d2b';c.font='bold 30px Arial';c.fillText('Rp',155,690);c.font='bold 55px Arial';c.fillText(Number(s.nominal||0).toLocaleString('id-ID')+',-',245,715);
+  c.textAlign='left';c.fillStyle='#56665d';c.font='21px Arial';c.fillText(`VA BSI: ${p.nomorVA||s.nomorVA||'-'}   |   Tanggal setoran: ${receiptDate(s.tgl)}   |   Status: Dikonfirmasi`,115,858);
+  c.fillStyle='#6d776f';c.font='19px Arial';c.fillText(`ID transaksi: ${s.id}`,115,904);
+  c.fillText('Dokumen ini dibuat otomatis oleh sistem TaQur dan tidak memerlukan tanda tangan basah.',115,940);
+  const safe=String(p.nama||'peserta').trim().replace(/[^a-z0-9]+/gi,'-').replace(/^-|-$/g,'').toLowerCase();
+  canvas.toBlob(blob=>{
+    if(!blob) return showPopup('error','Browser gagal membuat file kwitansi. Silakan coba kembali.');
+    const url=URL.createObjectURL(blob);const link=document.createElement('a');
+    link.download=`kwitansi-taqur-${safe}-${String(s.id).slice(0,8)}.png`;link.href=url;document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  },'image/png');
 };
 
 let popupTimer=null;
@@ -989,6 +1060,7 @@ async function loadSaldoForParticipant(p){
     .sort((a,b)=>(b.tglInput?.seconds||0)-(a.tglInput?.seconds||0));
   const confirmed=all.filter(s=>s.status==='confirmed');
   const pending=all.filter(s=>s.status==='pending');
+  window.taqurReceiptRows=all;
   const saldo=confirmed.reduce((a,x)=>a+Number(x.nominal||0),0);
   const targetP=p.targetNominal||3500000; const pc=pct(saldo,targetP);
   document.getElementById('alert-cek').classList.remove('show');
@@ -1006,7 +1078,7 @@ async function loadSaldoForParticipant(p){
     const badge=x.status==='confirmed'?'<span class="badge badge-green">✅ Dikonfirmasi</span>':x.status==='rejected'?'<span class="badge badge-red">❌ Ditolak</span>':'<span class="badge badge-yellow">⏳ Menunggu verifikasi</span>';
     return `<div class="history-item"><div><div style="font-weight:600;font-size:13px">Transfer VA BSI ${badge}</div><div class="h-tgl">${tglFull(x.tglInput)}</div>
       ${x.catatan?`<div class="h-tgl">📝 ${esc(x.catatan)}</div>`:''}${x.alasanTolak?`<div class="h-tgl" style="color:#c62828">❌ ${esc(x.alasanTolak)}</div>`:''}</div>
-      <div class="h-nom">+${rp(x.nominal)}</div></div>`;
+      <div class="history-action"><div class="h-nom">+${rp(x.nominal)}</div>${x.status==='confirmed'?`<button class="receipt-download-btn" onclick="downloadKwitansi('${x.id}')">⬇️ Kwitansi Elektronik</button>`:''}</div></div>`;
   }).join('');
   resEl.style.display='block';
 }
@@ -2033,6 +2105,9 @@ body{font-family:'Tajawal',sans-serif;background:var(--krem);color:var(--teks);m
 .history-item:last-child{border-bottom:none;}
 .h-tgl{color:#888;font-size:11px;margin-top:2px;}
 .h-nom{font-weight:700;color:var(--hijau-mid);white-space:nowrap;}
+.history-action{display:flex;flex-direction:column;align-items:flex-end;gap:7px;flex-shrink:0;}
+.receipt-download-btn{border:1px solid var(--hijau);border-radius:8px;background:#f3faf5;color:var(--hijau);font:700 10.5px 'Tajawal',sans-serif;padding:6px 8px;cursor:pointer;white-space:nowrap;}
+.receipt-download-btn:active{transform:scale(.98);background:#e3f2e7;}
 .badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700;}
 .badge-green{background:#e8f5e9;color:#2e7d32;}
 .badge-yellow{background:#fff8e1;color:#f9a825;}
