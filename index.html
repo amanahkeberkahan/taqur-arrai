@@ -1341,6 +1341,7 @@ async function renderDetail() {
       <a class="participant-wa-detail" href="${participantWaUrl(p)}" target="_blank" rel="noopener" title="Chat peserta melalui WhatsApp">📱 ${esc(p.hp)} · Buka WhatsApp</a>
       <div class="s-jenis">${esc(p.jenis)}</div>
       <span class="s-angka">${rp(saldo)}</span><div class="s-label">Saldo Dikonfirmasi · ${confirmed.length}x setor</div><div class="s-progress"><div class="s-pfill" style="width:${pc}%"></div></div><div class="s-pct">${pc}%</div><div class="s-target">dari target pribadi ${rp(targetP)}</div></div>
+    <div class="card"><div class="card-title">✏️ Edit Data Peserta</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div><label class="form-label">Nama Peserta</label><input type="text" class="form-input" id="edit-nama-${p.id}" value="${esc(p.nama||'')}" placeholder="Nama lengkap"></div><div><label class="form-label">No. HP</label><input type="text" inputmode="numeric" class="form-input" id="edit-hp-${p.id}" value="${esc(p.hp||'')}" placeholder="628xxx"></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><div><label class="form-label">Paket / Jenis</label><input type="text" class="form-input" id="edit-jenis-${p.id}" value="${esc(p.jenis||'')}" placeholder="Contoh: Patungan Sapi · Rp 3.500.000"></div><div><label class="form-label">Alamat</label><input type="text" class="form-input" id="edit-alamat-${p.id}" value="${esc(p.alamat||'')}" placeholder="Alamat peserta"></div></div><div style="font-size:10px;color:#888;margin-top:6px;line-height:1.5">Jika No. HP diubah, login peserta ikut dipindahkan ke nomor baru. Nomor VA tidak otomatis berubah karena harus sesuai data BSI.</div><button class="btn btn-outline" onclick="simpanDataPeserta('${p.id}')" style="margin-top:9px">💾 Simpan Data Peserta</button></div>
     <div class="card" style="border:2px solid ${p.authUid?'#4caf50':'#ff9800'}"><div class="card-title">🔐 Akses Aman Peserta</div>
       <div style="font-size:12px;margin-bottom:10px;color:${p.authUid?'#2e7d32':'#e65100'}">${p.authUid?'✅ Akun PIN aktif. Tombol di bawah akan mereset PIN dan menonaktifkan akun lama.':'⚠️ Peserta lama belum memiliki akun Firebase Authentication.'}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="pin-inp-${p.id}" placeholder="PIN baru 6 digit"><input type="password" inputmode="numeric" maxlength="6" class="form-input" id="pin2-inp-${p.id}" placeholder="Ulangi PIN"></div>
@@ -1376,6 +1377,42 @@ window.hapusPeserta=async function(pid){
 };
 
 window.simpanVA=async function(pid){return approveVA(pid);};
+
+window.simpanDataPeserta=async function(pid){
+  const p=allPeserta.find(x=>x.id===pid);if(!p)return showAlert('alert-adm-panel','error','Data peserta tidak ditemukan.');
+  const nama=(document.getElementById('edit-nama-'+pid)?.value||'').trim();
+  const hp=normHP(document.getElementById('edit-hp-'+pid)?.value||'');
+  const alamat=(document.getElementById('edit-alamat-'+pid)?.value||'').trim();
+  const jenis=(document.getElementById('edit-jenis-'+pid)?.value||'').trim();
+  if(!nama)return showAlert('alert-adm-panel','error','Nama peserta tidak boleh kosong.');
+  if(!hp||hp.length<10)return showAlert('alert-adm-panel','error','No. HP tidak valid.');
+  if(!jenis)return showAlert('alert-adm-panel','error','Paket/Jenis tidak boleh kosong.');
+  const oldHp=String(p.hp||'');
+  const hpChanged=hp!==oldHp;
+  if(hpChanged){
+    const lookup=await getDoc(doc(db,'login_lookup',hp));
+    if(lookup.exists() && lookup.data()?.participantId!==pid){
+      return showAlert('alert-adm-panel','error','No. HP baru sudah digunakan peserta lain.');
+    }
+    if(!confirm('No. HP peserta akan diubah. Login peserta selanjutnya memakai nomor baru. Lanjutkan?'))return;
+  }
+  try{
+    const batch=writeBatch(db);
+    batch.update(doc(db,'peserta',pid),{nama,hp,alamat,jenis,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid,updatedByName:currentAdmin.nama});
+    if(p.authUid){batch.set(doc(db,'users',p.authUid),{nama,hp,updatedAt:serverTimestamp(),updatedBy:currentAdmin.uid},{merge:true});}
+    if(hpChanged){
+      if(oldHp)batch.set(doc(db,'login_lookup',oldHp),{active:false,replacedByHp:hp,updatedAt:serverTimestamp()},{merge:true});
+      batch.set(doc(db,'login_lookup',hp),{hp,uid:p.authUid||'',participantId:pid,loginEmail:p.loginEmail||'',active:true,registered:true,updatedAt:serverTimestamp()},{merge:true});
+    }
+    await batch.commit();
+    const setSnap=await getDocs(query(collection(db,'setoran'),where('pesertaId','==',pid)));
+    const rows=setSnap.docs.map(d=>({id:d.id,...d.data()})).filter(x=>x.status!=='deleted');
+    for(let i=0;i<rows.length;i+=400){const b=writeBatch(db);rows.slice(i,i+400).forEach(x=>b.update(doc(db,'setoran',x.id),{nama,hp,nomorVA:p.nomorVA||x.nomorVA||''}));await b.commit();}
+    await writeAudit('UPDATE_PARTICIPANT_DATA','peserta',pid,{oldNama:p.nama||'',newNama:nama,oldHp,hp,jenis});
+    showAlert('alert-adm-panel','success','✅ Data peserta berhasil diperbarui.');
+    await renderAdminPanel();detailId=pid;adminView='detail';document.getElementById('adm-list-view').style.display='none';document.getElementById('adm-detail').style.display='block';await renderDetail();
+  }catch(e){showAlert('alert-adm-panel','error','Gagal update data peserta: '+authMessage(e));}
+};
 
 window.simpanTargetPeserta=async function(pid){
   const v=parseInt(document.getElementById('target-inp-'+pid)?.value);if(!v||v<100000)return alert('Target minimal Rp 100.000.');
